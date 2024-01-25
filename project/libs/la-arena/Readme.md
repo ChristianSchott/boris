@@ -1,0 +1,1 @@
+# `la-arena` with `serde` support

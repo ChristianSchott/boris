@@ -1,0 +1,19 @@
+[workspace]
+
+members = [
+    "boris_shared",
+    "boris_analysis",
+    "boris_renderer",
+    "boris_app",
+    "boris_viewer",
+
+    "boris_exporter",
+
+    "libs/la-arena"
+]
+
+
+
+# FIXME: this is most likely not best practice, but it was the easiest way to add `serde` support to `la-arena`
+[patch.crates-io]
+la-arena = { path = "libs/la-arena" }

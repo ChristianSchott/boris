@@ -1,0 +1,17 @@
+{
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Cargo launch",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--manifest-path=./boris_app/Cargo.toml",
+                    "--bin=boris_app",
+                ]
+            },
+            "args": [],
+        }
+    ]
+}

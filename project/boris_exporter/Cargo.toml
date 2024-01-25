@@ -1,0 +1,22 @@
+[package]
+name = "boris_exporter"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+boris_shared = { path = "../boris_shared" }
+boris_analysis = { path = "../boris_analysis" }
+boris_renderer = { path = "../boris_renderer" }
+
+egui = "0.24.0"
+eframe = { version = "0.24.0", default-features = false, features = [
+    "default_fonts", # Embed the default egui fonts.
+    "glow",          # Use the glow rendering backend. Alternative: "wgpu".
+] }
+
+la-arena = "0.3.1"
+env_logger = "0.10"
+
+serde_json = "1.0.108"
+
+image = { version = "0.24", default-features = false, features = ["png"] }

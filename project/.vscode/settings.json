@@ -1,0 +1,9 @@
+{
+  "cSpell.words": [
+    "egui",
+    "rects",
+    "resugaring"
+  ],
+  "rust-analyzer.showUnlinkedFileNotification": false
+  // "rust-analyzer.cargo.target": "wasm32-unknown-unknown"
+}
