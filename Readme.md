@@ -7,7 +7,9 @@ This project is part of my master's thesis at the Julius-Maximilians-University 
 
 For now it is a standalone program, but IDE integration may be something to look into for the future.
 
-<iframe src="https://christianschott.github.io/boris-viewer/#ownership" width=100% height="250"></iframe>
+![](/imgs/app_examble.png)
+
+### [>> Web viewer <<](https://christianschott.github.io/boris-viewer/#ownership)
 
 ## Limitations
 
