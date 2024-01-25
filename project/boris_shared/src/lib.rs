@@ -344,8 +344,10 @@ pub type DataFlowTreeId = Idx<DataFlowTree>;
 pub enum ConflictKind {
     Moved,
     AssignToImmutable,
+    AssignToValueBehindImmutableRef,
     MoveOutOfRef,
     UseOfUnassigned,
+    MutRefToImmutable,
 }
 
 impl Display for ConflictKind {
@@ -353,8 +355,14 @@ impl Display for ConflictKind {
         f.write_str(match self {
             ConflictKind::Moved => "Use of moved value.",
             ConflictKind::AssignToImmutable => "Assignment to immutable binding.",
+            ConflictKind::AssignToValueBehindImmutableRef => {
+                "Assignment to a value, which lies behind an immutable reference."
+            }
             ConflictKind::MoveOutOfRef => "Move out of reference.",
             ConflictKind::UseOfUnassigned => "Use of unassigned value.",
+            ConflictKind::MutRefToImmutable => {
+                "Creating an mutable reference to an immutable value."
+            }
         })
     }
 }
@@ -362,7 +370,7 @@ impl Display for ConflictKind {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Conflict {
     pub kind: ConflictKind,
-    pub targets: SmallVec<[DefId; 1]>,
+    pub targets: Vec<DefId>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

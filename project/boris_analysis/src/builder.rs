@@ -693,7 +693,7 @@ impl<'a> ThirBodyBuilder<'a> {
         let never_defs = self.never_defs();
         let def_order = self.def_ordering();
 
-        let (def_graph, def_graph_inv, conflicts) = self.analyze_data_flow();
+        let (def_graph, def_graph_inv, conflicts) = self.analyze_data_flow(&never_defs);
 
         let mut selectable_defs = DefSet::new(&self.defs);
         for (def, _) in def_graph.iter() {
@@ -743,18 +743,32 @@ impl<'a> ThirBodyBuilder<'a> {
 
         // extend until reaching some cf_branch..
         while let Some(top) = stack.pop() {
+            if never_defs[top] {
+                continue;
+            }
             never_defs.set(top, true);
 
             if let Some(next) = self.def_sequence.get(top) {
                 stack.extend(
                     next.iter()
                         .filter(|&id| {
-                            !matches!(
-                                self.defs[*id],
-                                Def::Expr(Expr::If { .. })
-                                    | Def::Expr(Expr::Match { .. })
-                                    | Def::Expr(Expr::Loop { .. }) // is loop a branch?
-                            )
+                            match &self.defs[*id] {
+                                Def::Expr(Expr::If {
+                                    then_branch,
+                                    else_branch,
+                                    ..
+                                }) => {
+                                    // when if and else branch are never, then continue
+                                    never_defs[*then_branch]
+                                        && else_branch.map(|id| never_defs[id]).unwrap_or(false)
+                                }
+                                Def::Expr(Expr::Match { arms, .. }) => {
+                                    // when all arms are never, then continue..
+                                    arms.iter().all(|arm| never_defs[arm.expr])
+                                }
+                                Def::Expr(Expr::Loop { .. }) => false, // FIXME: always stop at loop?
+                                _ => true,
+                            }
                         })
                         .copied(),
                 );
@@ -1251,6 +1265,8 @@ impl<'a> ThirBodyBuilder<'a> {
                         if let Some(else_branch) = else_branch {
                             stack.push((Some(*condition), *else_branch));
                             connect(*else_branch, next_child);
+                        } else {
+                            connect(*condition, next_child);
                         }
                         connect(*then_branch, next_child);
                     }
@@ -1510,6 +1526,7 @@ impl<'a> ThirBodyBuilder<'a> {
 
     fn analyze_data_flow(
         &self,
+        never_def_set: &DefSet,
     ) -> (
         ArenaMap<DefId, DefNode>,
         ArenaMap<DefId, SmallVec<[DefId; 1]>>,
@@ -1520,6 +1537,9 @@ impl<'a> ThirBodyBuilder<'a> {
                 let mut following = DefSet::new(&self.defs);
                 let mut stack = vec![def_id];
                 while let Some(top) = stack.pop() {
+                    if never_def_set[top] {
+                        continue;
+                    }
                     following.set(top, true);
                     if let Some(next) = sequence.get(top) {
                         stack.extend(next.iter());
@@ -1582,7 +1602,7 @@ impl<'a> ThirBodyBuilder<'a> {
                                             // limit scope
                                             if match &edge.kind {
                                                 EdgeKind::Move => *is_root,
-                                                EdgeKind::Reassign | EdgeKind::EndScope => true,
+                                                EdgeKind::EndScope => true,
                                                 _ => false,
                                             } {
                                                 def_scope

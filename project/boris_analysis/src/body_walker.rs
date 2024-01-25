@@ -23,7 +23,7 @@ use tuple::Map;
 
 use crate::{
     builder::{BindingUsageHint, ThirBodyBuilder},
-    move_path::{MoveData, MovePathId, PlaceElem, ProjectionKind, RefInfo},
+    move_path::{MoveData, MovePathId, PlaceElem, ProjectionKind},
 };
 
 pub struct MirBodyWalker<'a> {
@@ -36,7 +36,7 @@ pub struct MirBodyWalker<'a> {
     block_locations: ArenaMap<BasicBlockId, BasicBlockLocationMap>,
     param_locations: Vec<(LocalId, LocationId)>,
 
-    move_data: MoveData,
+    move_data: MoveData<'a>,
     binding_locals: ArenaMap<BindingId, LocalId>,
     local_bindings: ArenaMap<LocalId, BindingId>,
 }
@@ -83,7 +83,7 @@ pub type NodeId = Idx<Node>;
 pub struct Conflict {
     pub kind: ConflictKind,
     pub from: NodeId,
-    pub targets: SmallVec<[NodeId; 1]>,
+    pub targets: Vec<NodeId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -532,69 +532,58 @@ impl<'a> MirBodyWalker<'a> {
 
         let mut statements: ArenaMap<LocationId, NodeStatement> = ArenaMap::new();
 
-        let project_place =
-            |graph: &mut Graph,
-             span: Option<DefId>,
-             place: &Place,
-             usages: &mut Usages,
-             as_lvalue: Option<BindingId>|
-             -> PlaceProjection {
-                let projections = place.projection.lookup(&self.mir_body.projection_store);
-                // check for index projections
-                usages.extend(projections.iter().filter_map(|proj| match proj {
-                    PlaceElem::Index(local_id) => Some((
+        let project_place = |graph: &mut Graph,
+                             span: Option<DefId>,
+                             place: &Place,
+                             usages: &mut Usages,
+                             as_lvalue: Option<BindingId>|
+         -> PlaceProjection {
+            let projections = place.projection.lookup(&self.mir_body.projection_store);
+            // check for index projections
+            usages.extend(projections.iter().filter_map(|proj| match proj {
+                PlaceElem::Index(local_id) => {
+                    Some((
                         self.move_data.move_path_for(*local_id),
                         EdgeKind::Copy,
                         graph.alloc_rvalue(
                             span.and_then(|path| self.find_index_usage(path, *local_id)),
                         ),
-                    )),
-                    _ => None,
-                }));
+                    ))
+                }
+                _ => None,
+            }));
 
-                let mut move_path = self.move_data.move_path_for(place.local);
+            let mut move_path = self.move_data.move_path_for(place.local);
 
-                for proj in projections.iter() {
-                    if matches!(proj, PlaceElem::Deref) {
-                        let is_copy = self.move_data.is_copy(
-                            &self.mir_body.locals[place.local].ty,
-                            projections,
-                            self.mir_body.owner,
-                            self.crate_id,
-                            self.db,
-                        );
-                        // TODO: project the full path, to see if it is mutable (there may be multiple derefs)
-                        let is_mutable_ref = match &self.move_data[move_path].ref_info {
-                            crate::move_path::RefInfo::Reference { mutable } => *mutable,
-                            r => {
-                                println!("deref called on non-ref {r:?}. Probably a box.. TODO");
-                                true
-                            }
-                        };
-                        let kind = match as_lvalue {
+            for proj in projections.iter() {
+                if matches!(proj, PlaceElem::Deref) {
+                    let (is_copy, behind_mutable_ref) = self.move_data.place_info(place);
+                    let behind_mutable_ref = behind_mutable_ref.expect("This place contains a deref, thus information about the reference should be present.");
+                    let deref_node = graph.alloc(
+                        match as_lvalue {
                             Some(binding) => NodeKind::Deref {
-                                mutable: is_mutable_ref,
+                                mutable: behind_mutable_ref,
                                 binding: Some(binding),
                                 lvalue: true,
                             },
                             None => NodeKind::Deref {
-                                mutable: is_mutable_ref,
+                                mutable: behind_mutable_ref,
                                 binding: None,
                                 lvalue: false,
                             },
-                        };
-
-                        let deref_node = graph.alloc(kind, span);
-                        let lt = graph.lifetime.alloc(Lifetime::default());
-                        graph.associate_lt(lt, deref_node);
-                        usages.push((move_path, EdgeKind::Deref, deref_node));
-                        return PlaceProjection::Deref(deref_node, is_copy);
-                    } else {
-                        move_path = self.move_data.find_child(move_path, proj).unwrap();
-                    }
+                        },
+                        span,
+                    );
+                    let lt = graph.lifetime.alloc(Lifetime::default());
+                    graph.associate_lt(lt, deref_node);
+                    usages.push((move_path, EdgeKind::Deref, deref_node));
+                    return PlaceProjection::Deref(deref_node, is_copy);
+                } else {
+                    move_path = self.move_data.find_child(move_path, proj).unwrap();
                 }
-                PlaceProjection::MovePath(move_path)
-            };
+            }
+            PlaceProjection::MovePath(move_path)
+        };
 
         let place_to_lvalue =
             |graph: &mut Graph, place: &Place, location: LocationId, usages: &mut Usages| {
@@ -626,7 +615,11 @@ impl<'a> MirBodyWalker<'a> {
             match project_place(graph, span, place, usages, None) {
                 PlaceProjection::Deref(node, is_copy) => {
                     if matches!(kind, EdgeKind::Move) && !is_copy {
-                        println!("move out of ref!");
+                        graph.add_conflict(Conflict {
+                            kind: ConflictKind::MoveOutOfRef,
+                            from: node,
+                            targets: vec![],
+                        });
                     }
                     node
                 }
@@ -649,7 +642,11 @@ impl<'a> MirBodyWalker<'a> {
                         Some(match project_place(graph, span, place, usages, None) {
                             PlaceProjection::Deref(node, is_copy) => {
                                 if !is_copy {
-                                    println!("Move of non-copy operator.");
+                                    graph.add_conflict(Conflict {
+                                        kind: ConflictKind::MoveOutOfRef,
+                                        from: node,
+                                        targets: vec![],
+                                    });
                                 }
                                 node
                             }
@@ -676,10 +673,15 @@ impl<'a> MirBodyWalker<'a> {
                            lvalue_node: NodeId,
                            usages: &mut Usages| {
             let span = self.location_def(loc);
-            let capture_nodes = Box::from_iter(ops.iter().map(|op| match op {
-                Operand::Copy(place) => use_place(graph, place, EdgeKind::Copy, span, usages),
-                Operand::Move(place) => use_place(graph, place, EdgeKind::Move, span, usages),
-                Operand::Constant(_) | Operand::Static(_) => panic!("Invalid closure capture."),
+            let capture_nodes = Box::from_iter(ops.iter().filter_map(|op| {
+                Some(match op {
+                    Operand::Copy(place) => use_place(graph, place, EdgeKind::Copy, span, usages),
+                    Operand::Move(place) => use_place(graph, place, EdgeKind::Move, span, usages),
+                    Operand::Constant(_) | Operand::Static(_) => {
+                        println!("Invalid closure capture.");
+                        return None;
+                    }
+                })
             }));
             for node in capture_nodes.iter() {
                 graph.connect_lifetimes(*node, lvalue_node);
@@ -1046,6 +1048,11 @@ impl<'a> MirBodyWalker<'a> {
                     NodeStatement::Assignment { assigned, used } => {
                         for (usage_path, usage_kind, usage_node) in used.iter() {
                             if let Some(state) = path_states.get(*usage_path) {
+                                for source_node in state.iter_sources() {
+                                    graph.connect(source_node, *usage_node, *usage_kind);
+                                    graph.connect_lifetimes(source_node, *usage_node);
+                                }
+
                                 if let Some(moved_nodes) = &state.moved {
                                     graph.add_conflict(Conflict {
                                         kind: ConflictKind::Moved,
@@ -1054,9 +1061,29 @@ impl<'a> MirBodyWalker<'a> {
                                     })
                                 }
 
-                                for source_node in state.iter_sources() {
-                                    graph.connect(source_node, *usage_node, *usage_kind);
-                                    graph.connect_lifetimes(source_node, *usage_node);
+                                if let EdgeKind::Ref(true) = usage_kind {
+                                    let targets: Vec<_> = state
+                                        .iter_sources()
+                                        .filter_map(|source| match graph.nodes[source].kind {
+                                            NodeKind::Place(binding, _) => binding.and_then(|id| {
+                                                (!self.thir_builder[id].marked_mutable)
+                                                    .then_some(source)
+                                            }),
+                                            NodeKind::Deref {
+                                                lvalue: true,
+                                                mutable: false,
+                                                ..
+                                            } => Some(source),
+                                            _ => None,
+                                        })
+                                        .collect();
+                                    if !targets.is_empty() {
+                                        graph.conflicts.push(Conflict {
+                                            kind: ConflictKind::MutRefToImmutable,
+                                            from: *usage_node,
+                                            targets,
+                                        });
+                                    }
                                 }
                             } else {
                                 graph.add_conflict(Conflict {
@@ -1072,8 +1099,13 @@ impl<'a> MirBodyWalker<'a> {
                                 match assigned_node.kind {
                                     NodeKind::Deref { mutable, .. } => {
                                         if !mutable {
-                                            println!("Assignment to immutable reference!");
+                                            graph.add_conflict(Conflict {
+                                                kind: ConflictKind::AssignToValueBehindImmutableRef,
+                                                from: *assigned,
+                                                targets: vec![],
+                                            });
                                         }
+
                                         for orig_assign in path_state.iter_sources() {
                                             graph.connect(orig_assign, *assigned, EdgeKind::Deref);
                                             graph.connect_lifetimes(orig_assign, *assigned);
@@ -1104,7 +1136,8 @@ impl<'a> MirBodyWalker<'a> {
                                         }
                                     }
                                     NodeKind::Value | NodeKind::Drop => {
-                                        panic!("Assignment to non-place.")
+                                        // FIXME: this should probably be a panic..
+                                        println!("Assignment to non-place.");
                                     }
                                 }
                             };

@@ -1,7 +1,13 @@
 fn mutability() {
-    let immutable = String::from("Hello");
-    immutable.push_str(" world?");
+    let mut sum: i32 = 0;
 
-    let mut mutable = immutable;
-    mutable.push_str(" world!");
+    for i in 1..100 {
+        sum = sum + i;
+    }
+
+    let doubled = sum + sum;
+
+    println!("Doubled: {doubled}");
+
+    doubled = 42;
 }

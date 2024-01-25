@@ -15,6 +15,7 @@ enum ErrorKind {
     WriteFailed,
 }
 
+#[derive(Clone)]
 struct Item {
     module: String,
     func: String,
@@ -32,19 +33,17 @@ impl Item {
 }
 
 fn main() -> Result<(), ErrorKind> {
-    let export_items = [
-        // Item::new("example0", "main", None),
-        // Item::new("example1", "ref_into_enum", Some("data")),
+    let survey_examples = [
         Item::new("ownership", "ownership", Some("x")),
-        Item::new("copy_trait", "primitive_test", Some("number")),
-        Item::new("mutability", "mutability", Some("immutable")),
+        Item::new("copy", "fibonacci", Some("n")),
+        Item::new("mutability", "mutability", Some("sum")),
         Item::new("borrowing", "borrowing", Some("owned_string")),
+        Item::new("higher_order_fn", "higher_order_functions_example", None),
     ];
 
-    let capture_items = [
-        // Item::new("example0", "main", None),
-        // Item::new("example1", "ref_into_enum", Some("data")),
-    ];
+    let export_items = survey_examples.clone();
+
+    let capture_items = survey_examples.clone();
 
     let path_str = format!("{}\\..\\..\\example\\", env!("CARGO_MANIFEST_DIR"));
     let project_path = std::path::Path::new(&path_str)

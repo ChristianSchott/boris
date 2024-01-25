@@ -127,12 +127,16 @@ impl MovePath {
 }
 
 #[derive(Debug)]
-pub struct MoveData {
+pub struct MoveData<'a> {
+    db: &'a dyn HirDatabase,
+    body: &'a MirBody,
+    crate_id: CrateId,
+
     pub move_paths: Arena<MovePath>,
     pub locals: ArenaMap<LocalId, MovePathId>,
 }
 
-impl MoveData {
+impl<'a> MoveData<'a> {
     pub fn local(&self, mut move_path: MovePathId) -> LocalId {
         loop {
             move_path = match self.move_paths[move_path].parent {
@@ -164,59 +168,86 @@ impl MoveData {
         }
     }
 
-    fn ty_after_adjustment(ty: &Ty, proj: &PlaceElem, krate: CrateId, db: &dyn HirDatabase) -> Ty {
+    fn projected_ty(&self, ty: Ty, proj: &PlaceElem) -> Ty {
         proj.projected_ty(
-            ty.clone(),
-            db,
+            ty,
+            self.db,
             |c, subst, f| {
-                let (def, _) = db.lookup_intern_closure(c.into());
-                let infer = db.infer(def);
+                let (def, _) = self.db.lookup_intern_closure(c.into());
+                let infer = self.db.infer(def);
                 let (captures, _) = infer.closure_info(&c);
                 captures.get(f).expect("broken closure field").ty(subst)
             },
-            krate,
+            self.crate_id,
         )
     }
 
-    pub fn ty_after_adjustments(
-        ty: &Ty,
-        projections: &[PlaceElem],
-        krate: CrateId,
-        db: &dyn HirDatabase,
-    ) -> Ty {
+    pub fn ty_after_adjustments(&self, ty: &Ty, projections: &[PlaceElem]) -> Ty {
         let mut ty = ty.clone();
         for proj in projections {
-            ty = proj.projected_ty(
-                ty.clone(),
-                db,
-                |c, subst, f| {
-                    let (def, _) = db.lookup_intern_closure(c.into());
-                    let infer = db.infer(def);
-                    let (captures, _) = infer.closure_info(&c);
-                    captures.get(f).expect("broken closure field").ty(subst)
-                },
-                krate,
-            );
+            ty = self.projected_ty(ty, proj);
         }
         ty
     }
 
-    pub fn is_copy(
-        &self,
-        ty: &Ty,
-        projections: &[PlaceElem],
-        owner: DefWithBodyId,
-        krate: CrateId,
-        db: &dyn HirDatabase,
-    ) -> bool {
-        Self::ty_after_adjustments(ty, projections, krate, db).is_copy(db, owner)
+    pub fn is_copy(&self, ty: &Ty, projections: &[PlaceElem]) -> bool {
+        self.ty_after_adjustments(ty, projections)
+            .is_copy(self.db, self.body.owner)
     }
 
     pub fn is_root(&self, move_path_id: MovePathId) -> bool {
         matches!(self[move_path_id].parent, ParentKind::Local(_))
     }
 
-    pub fn new(body: &MirBody, db: &dyn HirDatabase) -> MoveData {
+    pub fn place_info(&self, place: &Place) -> (bool, Option<bool>) {
+        let mut ty = self.body.locals[place.local].ty.clone();
+        let mut behind_mutable_ref = None;
+        for proj in place.projection.lookup(&self.body.projection_store) {
+            if matches!(proj, PlaceElem::Deref) {
+                match ty.kind(Interner) {
+                    TyKind::Ref(mutability, _, _) | TyKind::Raw(mutability, _) => {
+                        behind_mutable_ref = Some(matches!(mutability, Mutability::Mut));
+                    }
+                    // TyKind::Adt(id, _) => ,// check if is lang_item owned box
+                    _ => {
+                        println!("Deref called on non-ref type. Probably a box.. TODO");
+                        // just pretend like it is mutable for now..
+                        behind_mutable_ref = Some(true);
+                    }
+                }
+            }
+            ty = self.projected_ty(ty.clone(), proj);
+        }
+        let is_copy = ty.is_copy(self.db, self.body.owner);
+        (is_copy, behind_mutable_ref)
+    }
+
+    fn alloc_place(&mut self, place: &Place) {
+        let mut ty = self.body.locals[place.local].ty.clone();
+        let mut move_path = self.move_path_for(place.local);
+        for projection in place.projection.lookup(&self.body.projection_store) {
+            if matches!(projection, ProjectionElem::Deref) {
+                break;
+            }
+            ty = self.projected_ty(ty.clone(), projection);
+            if let Some(child_path) = self.find_child(move_path, projection) {
+                move_path = child_path;
+            } else {
+                let child_path = self.move_paths.alloc(MovePath::new(
+                    ParentKind::Path(move_path),
+                    &ty,
+                    self.body.owner,
+                    self.db,
+                ));
+                self.move_paths[move_path]
+                    .children
+                    .push((projection.into(), child_path));
+                move_path = child_path;
+            }
+        }
+    }
+
+    pub fn new(body: &'a MirBody, db: &'a dyn HirDatabase) -> MoveData<'a> {
         let module_id = body.owner.module(db.upcast());
         let crate_id = module_id.krate();
 
@@ -241,32 +272,19 @@ impl MoveData {
         //     println!("{local:?}: is copy {}", move_paths[*mp].is_copy);
         // }
 
+        let mut move_data = MoveData {
+            db,
+            body,
+            crate_id,
+            move_paths,
+            locals,
+        };
+
         Self::walk_places(body, |place, store| {
-            let mut ty = body.locals[place.local].ty.clone();
-            let mut move_path = locals[place.local];
-            for projection in place.projection.lookup(store) {
-                if matches!(projection, ProjectionElem::Deref) {
-                    break;
-                }
-                ty = Self::ty_after_adjustment(&ty, projection, crate_id, db);
-                if let Some(child_path) = move_paths[move_path].find_child(projection) {
-                    move_path = child_path;
-                } else {
-                    let child_path = move_paths.alloc(MovePath::new(
-                        ParentKind::Path(move_path),
-                        &ty,
-                        body.owner,
-                        db,
-                    ));
-                    move_paths[move_path]
-                        .children
-                        .push((projection.into(), child_path));
-                    move_path = child_path;
-                }
-            }
+            move_data.alloc_place(place);
         });
 
-        MoveData { move_paths, locals }
+        move_data
     }
 
     // stolen from mir.rs
@@ -365,7 +383,7 @@ impl MoveData {
     }
 }
 
-impl std::ops::Index<MovePathId> for MoveData {
+impl<'a> std::ops::Index<MovePathId> for MoveData<'a> {
     type Output = MovePath;
 
     fn index(&self, index: MovePathId) -> &Self::Output {

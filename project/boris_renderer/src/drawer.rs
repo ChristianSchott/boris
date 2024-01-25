@@ -1397,11 +1397,12 @@ impl<'a> DrawBuffer<'a> {
                 let hovered = usage_rect.contains(cursor);
                 if hovered || state.liveliness.active_defs.contains_idx(from) {
                     for conflict in conflicts {
-                        for moved_rect in
+                        for target_rect in
                             conflict.targets.iter().filter_map(|id| def_rects.get(*id))
                         {
-                            painter.line_segment(
-                                [usage_rect.center(), moved_rect.center()],
+                            painter.rect_stroke(
+                                target_rect.expand(2.5f32),
+                                Rounding::same(5f32),
                                 error_stroke,
                             );
                         }

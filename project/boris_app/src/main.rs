@@ -9,7 +9,7 @@ fn main() {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([640.0, 420.0])
+            .with_inner_size([800.0, 600.0])
             .with_min_inner_size([420.0, 300.0]),
         default_theme: Theme::Light,
         follow_system_theme: false,

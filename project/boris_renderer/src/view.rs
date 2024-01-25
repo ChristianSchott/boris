@@ -1,5 +1,5 @@
 use boris_shared::{BindingId, Def, DefEdgeKind, DefId, DefNode, DefSet, NodeKind, ThirBody};
-use egui::{Context, Pos2, Rect, Sense, Ui};
+use egui::{Context, Pos2, Rect, ScrollArea, Sense, Ui, Vec2};
 use la_arena::Arena;
 
 use crate::{body_drawer, DefLivelinessInfo, DrawBuffer, State, UsageKind};
@@ -307,30 +307,42 @@ pub fn boris_view(
     );
     let mut buffer = DrawBuffer::new(ctx); // TODO reuse & clear this instead of recreating
     let root_id = body_drawer::append_main_body(&mut buffer, body, state.clone());
-    let size = buffer.size(root_id);
-    let (response, painter) = ui.allocate_painter(size, Sense::click_and_drag());
 
-    let pointer_pos = ctx.input(|input| input.pointer.hover_pos().unwrap_or(Pos2::ZERO));
-    let selected = buffer.draw(
-        &painter,
-        response.rect,
-        root_id,
-        pointer_pos,
-        &state,
-        &body.conflicts,
-        &body.selectable_defs,
-    );
+    let mut draw = |ui: &mut Ui, size: Vec2| -> Rect {
+        let (response, painter) = ui.allocate_painter(size, Sense::click());
+        let pointer_pos = ctx.input(|input| input.pointer.hover_pos().unwrap_or(Pos2::ZERO));
+        let selected = buffer.draw(
+            &painter,
+            response.rect,
+            root_id,
+            pointer_pos,
+            &state,
+            &body.conflicts,
+            &body.selectable_defs,
+        );
 
-    ui.input(|input| {
-        if let Some(selected_thir) = selected.selected_thir() {
-            if input.pointer.button_clicked(egui::PointerButton::Primary) {
-                *selected_def = Some(selected_thir);
+        ui.input(|input| {
+            if let Some(selected_thir) = selected.selected_thir() {
+                if input.pointer.button_clicked(egui::PointerButton::Primary) {
+                    *selected_def = Some(selected_thir);
+                }
             }
-        }
-        if input.pointer.button_clicked(egui::PointerButton::Secondary) {
-            *selected_def = None;
-        }
-    });
+            if input.pointer.button_clicked(egui::PointerButton::Secondary) {
+                *selected_def = None;
+            }
+        });
+        response.rect
+    };
 
-    response.rect
+    let available_size = ui.available_size();
+    let size = buffer.size(root_id);
+    let rect = if size.x > available_size.x || size.y > available_size.y {
+        egui::ScrollArea::both()
+            .drag_to_scroll(false)
+            .show(ui, |ui| draw(ui, size))
+            .inner
+    } else {
+        draw(ui, available_size)
+    };
+    Rect::from_min_size(rect.min, size)
 }

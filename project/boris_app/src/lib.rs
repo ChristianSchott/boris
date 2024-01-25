@@ -162,16 +162,14 @@ impl MirVisApp {
         let mut analysis = AnalysisThread::new(rx, ty, Some(cc.egui_ctx.clone()));
 
         let handle = thread::spawn(move || while let Ok(_) = analysis.main_loop() {});
-        Self::new(cc, ry, tx, Some(handle))
+        Self::new(ry, tx, Some(handle))
     }
 
     pub fn new(
-        cc: &eframe::CreationContext<'_>,
         ry: mpsc::Receiver<AnalysisResult>,
         tx: mpsc::Sender<UserMessage>,
         join_handle: Option<JoinHandle<()>>,
     ) -> Self {
-        // String::from("C:\\Users\\Chris\\Documents\\Git\\rust\\playground")
         Self {
             sender: tx,
             receiver: ry,
@@ -388,18 +386,9 @@ impl eframe::App for MirVisApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::both().show(ui, |ui| {
-                if let Some(fn_drawer) =
-                    self.selected_fn.and_then(|id| self.fn_drawers.get_mut(&id))
-                {
-                    boris_renderer::boris_view(
-                        ctx,
-                        ui,
-                        &fn_drawer.body,
-                        &mut fn_drawer.selected_def,
-                    );
-                }
-            });
+            if let Some(fn_drawer) = self.selected_fn.and_then(|id| self.fn_drawers.get_mut(&id)) {
+                boris_renderer::boris_view(ctx, ui, &fn_drawer.body, &mut fn_drawer.selected_def);
+            }
         });
     }
 

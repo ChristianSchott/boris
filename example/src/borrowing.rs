@@ -3,17 +3,23 @@ fn borrow_string(s: &String) {}
 fn modify_string(s: &mut String) {}
 
 fn borrowing() {
-    let mut owned_string = String::from("Hello");
+    println!("Multiple borrows to an immutable string.");
+    {
+        let owned_string = String::from("Hello");
 
-    let borrow_a = &owned_string;
-    let borrow_b = &owned_string;
-    borrow_string(&owned_string);
+        let borrow = &owned_string;
+        borrow_string(&owned_string);
+        borrow_string(borrow);
+    }
 
-    borrow_string(borrow_a);
+    let mut mutable_string = String::from("World");
 
-    let mutable_borrow = &mut owned_string;
+    if mutable_string.is_empty() {
+        mutable_string.push_str("Hello there.");
+    } else {
+        println!("The string is not empty.");
+        modify_string(&mut mutable_string);
+    }
 
-    modify_string(&mut owned_string);
-
-    modify_string(mutable_borrow);
+    println!("'{}'", mutable_string);
 }
