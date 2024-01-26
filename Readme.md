@@ -5,6 +5,9 @@ Aiming to make these concepts easier to grasp for beginners, and experienced pro
 
 This project is part of my master's thesis at the Julius-Maximilians-University Würzburg, so the main focus is currently on finishing the thesis, not adding more features and fixing bugs ( feel free to do so, though :) )
 
+There is currently an ongoing survey to evaluate this project: https://opnform.com/forms/visualizing-ownership-and-borrowing-in-rust-programs-nseo4z
+Please consider taking two minutes and filling out the form, it would help a lot! :) (it contains only 7 short questions)
+
 For now it is a standalone program, but IDE integration may be something to look into for the future.
 
 ![](/imgs/app_examble.png)
