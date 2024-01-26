@@ -233,7 +233,7 @@ impl<'a> BodyRenderer<'a> {
     fn append_expr(&self, buffer: &mut DrawBuffer, expr: &Expr, id: DefId) -> DrawCallId {
         match expr {
             Expr::Path(info) => match info {
-                PathInfo::Binding(id) => buffer.append_str(&self.body.bindings[*id].name),
+                PathInfo::Binding(id) => buffer.append_str(&self.body.bindings[*id].name()),
                 PathInfo::Path(path) => buffer.append_str(&path),
             },
             Expr::Literal(lit) => buffer.append_str(&lit),
@@ -377,12 +377,17 @@ impl<'a> BodyRenderer<'a> {
                 let args = self.append_args(buffer, &args);
                 let args = buffer.append_braced(args, BracketType::Round, Color32::BLACK);
 
-                if buffer.is_complex(receiver_call) {
+                // FIXME: layouting should not be hard coded like this..
+                let is_chained_call = matches!(
+                    self.body.defs[*receiver],
+                    Def::Expr(Expr::MethodCall { .. })
+                );
+                if buffer.is_complex(receiver_call) || is_chained_call {
                     let call = buffer.append_horizontal(&[dot, name, args], false);
                     let call = buffer.append_spaced(
                         call,
                         Margin {
-                            left: 20f32,
+                            left: 15f32,
                             ..Default::default()
                         },
                     );
@@ -485,6 +490,7 @@ impl<'a> BodyRenderer<'a> {
                 capture_by,
                 capture_dummy,
                 return_dummy, // TODO?
+                ..
             } => {
                 let args = Box::from_iter(args.iter().map(|arg| self.append_def(buffer, *arg)));
                 let args = self.append_args(buffer, &args);
@@ -567,7 +573,7 @@ impl<'a> BodyRenderer<'a> {
                 let annotation = annotation
                     .map(|x| buffer.literal(TextLitKind::BindingAnnotation(x)))
                     .unwrap_or(buffer.noop());
-                let binding = buffer.append_str(&self.body.bindings[*binding_id].name);
+                let binding = buffer.append_str(&self.body.bindings[*binding_id].name());
                 if let Some(subpat) = self.append_opt(buffer, *subpat) {
                     let children = [annotation, binding, buffer.literal(TextLitKind::At), subpat];
                     buffer.append_horizontal(&children, false)
@@ -739,12 +745,15 @@ impl<'a> BodyRenderer<'a> {
         ];
         let header = buffer.append_horizontal(&children, false);
         let body = self.append_def(buffer, self.body.body_expr);
+
+        // TODO: add an Expr::ReturnValue { binding, type_ref } ?
         let children = [
             buffer.literal(TextLitKind::Arrow),
             buffer.append_str(&self.body.return_type.1),
         ];
         let ret = buffer.append_horizontal(&children, false);
         buffer.assoc_def_id(ret, self.body.return_type.0);
+
         let id = buffer.append_sequential(&[header, body, ret], false, &self.state);
         let from_def = self
             .body

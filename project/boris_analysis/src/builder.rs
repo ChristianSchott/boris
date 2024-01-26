@@ -52,6 +52,7 @@ pub(crate) struct ThirBodyBuilder<'a> {
     body_def_id: DefId,
     param_def_ids: Vec<DefId>,
     ret_def_id: DefId,
+    ret_binding_id: BindingId,
 
     child_def_map: ArenaMap<DefId, SmallVec<[DefId; 1]>>,
     parent_def_map: ArenaMap<DefId, DefId>,
@@ -93,6 +94,17 @@ impl<'a> ThirBodyBuilder<'a> {
             .get(binding_id)
             .and_then(|defs| defs.first())
             .cloned()
+    }
+
+    pub fn marked_mut(&self, binding_id: BindingId) -> bool {
+        match &self[binding_id] {
+            Binding::Real { marked_mutable, .. } => *marked_mutable,
+            Binding::Fake => false,
+        }
+    }
+
+    pub fn binding_name(&self, binding_id: BindingId) -> &str {
+        self[binding_id].name()
     }
 
     fn parent_def_map(defs: &Arena<Def>) -> ArenaMap<DefId, DefId> {
@@ -195,6 +207,7 @@ impl<'a> ThirBodyBuilder<'a> {
                         capture_dummy,
                         capture_by: _,
                         return_dummy,
+                        ..
                     } => {
                         set_parent(capture_dummy);
                         set_parent(body_expr);
@@ -250,12 +263,8 @@ impl<'a> ThirBodyBuilder<'a> {
             .map(|children| children.as_slice())
     }
 
-    pub fn next_cf_def(&self, def: DefId) -> Option<DefId> {
-        self.next_def_map.get(def).cloned()
-    }
-
-    pub fn return_def(&self) -> DefId {
-        self.ret_def_id
+    pub fn return_binding(&self) -> BindingId {
+        self.ret_binding_id
     }
 
     fn new(
@@ -285,7 +294,7 @@ impl<'a> ThirBodyBuilder<'a> {
             .bindings
             .iter()
             .map(|(hir_id, binding)| {
-                let id = bindings.alloc(Binding {
+                let id = bindings.alloc(Binding::Real {
                     name: binding.name.display(db.upcast()).to_string(),
                     marked_mutable: matches!(binding.mode, hir::BindingAnnotation::Mutable),
                 });
@@ -298,6 +307,19 @@ impl<'a> ThirBodyBuilder<'a> {
         let map_pat = |hir_pat_id: hir::PatId| pat_map.get(hir_pat_id).copied().unwrap();
         let map_binding =
             |hir_binding_id: hir::BindingId| bindings_map.get(hir_binding_id).copied().unwrap();
+
+        let mut binding_defs: ArenaMap<_, SmallVec<_>> = body
+            .bindings
+            .iter()
+            .map(|(id, binding)| {
+                let defs = binding
+                    .definitions
+                    .iter()
+                    .map(|def| map_pat(*def))
+                    .collect();
+                (map_binding(id), defs)
+            })
+            .collect();
 
         let path_to_string = |path: &Path| -> String {
             match path {
@@ -524,22 +546,30 @@ impl<'a> ThirBodyBuilder<'a> {
                     body,
                     capture_by,
                     ..
-                } => Expr::Closure {
-                    capture_dummy: noop(&mut defs),
-                    args: if args.is_empty() {
-                        // FIXME: with the new `capture_dummy` this is probably not needed anymore
-                        // empty args cause problems during lt-span generation, so we insert a dummy def_id here..
-                        vec![noop(&mut defs)]
-                    } else {
-                        args.iter().map(|arg| map_pat(*arg)).collect_vec()
-                    },
-                    body_expr: map_expr(*body),
-                    capture_by: match capture_by {
-                        hir::CaptureBy::Value => boris_shared::CaptureBy::Value,
-                        hir::CaptureBy::Ref => boris_shared::CaptureBy::Ref,
-                    },
-                    return_dummy: noop(&mut defs),
-                },
+                } => {
+                    let ret_def_id = noop(&mut defs);
+                    let ret_binding_id = bindings.alloc(Binding::Fake);
+                    binding_defs.insert(ret_binding_id, smallvec![ret_def_id]);
+
+                    Expr::Closure {
+                        capture_binding: bindings.alloc(Binding::Fake),
+                        capture_dummy: noop(&mut defs),
+                        args: if args.is_empty() {
+                            // FIXME: with the new `capture_dummy` this is probably not needed anymore
+                            // empty args cause problems during lt-span generation, so we insert a dummy def_id here..
+                            vec![noop(&mut defs)]
+                        } else {
+                            args.iter().map(|arg| map_pat(*arg)).collect_vec()
+                        },
+                        body_expr: map_expr(*body),
+                        capture_by: match capture_by {
+                            hir::CaptureBy::Value => boris_shared::CaptureBy::Value,
+                            hir::CaptureBy::Ref => boris_shared::CaptureBy::Ref,
+                        },
+                        return_dummy: ret_def_id,
+                        return_binding: ret_binding_id,
+                    }
+                }
                 hir::Expr::Array(vals) => Expr::Array(match vals {
                     hir::Array::ElementList { elements, .. } => Array::ElementList {
                         elements: elements.iter().map(|e| map_expr(*e)).collect_vec(),
@@ -632,22 +662,12 @@ impl<'a> ThirBodyBuilder<'a> {
             });
         }
 
-        let binding_defs = body
-            .bindings
-            .iter()
-            .map(|(id, binding)| {
-                let defs = binding
-                    .definitions
-                    .iter()
-                    .map(|def| map_pat(*def))
-                    .collect();
-                (map_binding(id), defs)
-            })
-            .collect();
+        let ret_def_id = noop(&mut defs);
+        let ret_binding_id = bindings.alloc(Binding::Fake);
+        binding_defs.insert(ret_binding_id, smallvec![ret_def_id]);
 
         let body_def_id = map_expr(body.body_expr);
         let param_def_ids = body.params.iter().cloned().map(map_pat).collect_vec();
-        let ret_def_id = noop(&mut defs);
         let parent_def_map = Self::parent_def_map(&defs);
         let child_def_map = Self::child_def_map(&defs);
         let next_def_map = Self::next_control_flow_def_map(&defs);
@@ -663,6 +683,7 @@ impl<'a> ThirBodyBuilder<'a> {
             body_def_id,
             param_def_ids,
             ret_def_id,
+            ret_binding_id,
             parent_def_map,
             child_def_map,
             next_def_map,
@@ -1483,6 +1504,11 @@ impl<'a> ThirBodyBuilder<'a> {
     }
 
     pub fn find_binding_assignment(&self, def_id: DefId, binding_id: BindingId) -> Option<DefId> {
+        if matches!(self.bindings[binding_id], Binding::Fake) {
+            // this is a dummy binding, thus is can't be found (this is currently only used for return values)
+            return self.binding_def(binding_id);
+        }
+
         let mut stack = vec![def_id];
         while let Some(top) = stack.pop() {
             match &self.defs[top] {
@@ -1509,7 +1535,7 @@ impl<'a> ThirBodyBuilder<'a> {
 
         println!(
             "failed finding assignment to binding '{}' ({}) in '{:?}'",
-            self.bindings[binding_id].name,
+            self.binding_name(binding_id),
             binding_id.into_raw().into_u32(),
             self.defs[def_id]
         );
@@ -1603,6 +1629,7 @@ impl<'a> ThirBodyBuilder<'a> {
                                             if match &edge.kind {
                                                 EdgeKind::Move => *is_root,
                                                 EdgeKind::EndScope => true,
+                                                EdgeKind::Reassign => true,
                                                 _ => false,
                                             } {
                                                 def_scope
@@ -1648,7 +1675,7 @@ impl<'a> ThirBodyBuilder<'a> {
                             })
                             .or_insert_with(|| DefNode {
                                 kind: boris_shared::NodeKind::Source {
-                                    mutable: self.bindings[*binding].marked_mutable, // TODO: mutability of deref is not determined by binding..
+                                    mutable: self.marked_mut(*binding),
                                     binding: *binding,
                                     contains_lt: !node.lifetimes.is_empty(),
                                 },

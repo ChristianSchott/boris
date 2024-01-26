@@ -139,7 +139,7 @@ fn analyze(analysis: &Analysis, item: &Item) -> Result<ExampleState, ErrorKind> 
             .iter()
             .find_map(|(def, node)| match node.kind {
                 boris_shared::NodeKind::Source { binding, .. } => {
-                    (&body.bindings[binding].name == select).then_some(def)
+                    (&body.bindings[binding].name() == select).then_some(def)
                 }
                 _ => None,
             })

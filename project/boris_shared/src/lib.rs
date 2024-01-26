@@ -61,9 +61,17 @@ impl Def {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Binding {
-    pub name: String,
-    pub marked_mutable: bool,
+pub enum Binding {
+    Real { name: String, marked_mutable: bool },
+    Fake,
+}
+impl Binding {
+    pub fn name(&self) -> &str {
+        match self {
+            Binding::Real { name, .. } => &name,
+            Binding::Fake => "Fake",
+        }
+    }
 }
 pub type BindingId = Idx<Binding>;
 
@@ -162,11 +170,13 @@ pub enum Expr {
         exprs: Vec<DefId>,
     },
     Closure {
+        capture_binding: BindingId,
         capture_dummy: DefId,
         args: Vec<DefId>,
         body_expr: DefId,
         capture_by: CaptureBy,
         return_dummy: DefId,
+        return_binding: BindingId,
     },
     Array(Array),
     Box {

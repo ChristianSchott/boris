@@ -467,6 +467,9 @@ impl<'a> DrawBuffer<'a> {
         // is complex itself, or contains any complex draw calls in its direct children
         let complex_child = || -> bool {
             self.walk_children(id, &mut |call| {
+                // if matches!(self.buffer[call.id].kind, DrawCallKind::Closure(..)) {
+                //     TreeWalkerState::Continue
+                // } else
                 if let Some(is_complex) = self.call_complexity.get(call.id) {
                     if *is_complex {
                         TreeWalkerState::Return(())

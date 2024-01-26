@@ -39,6 +39,7 @@ pub struct MirBodyWalker<'a> {
     move_data: MoveData<'a>,
     binding_locals: ArenaMap<BindingId, LocalId>,
     local_bindings: ArenaMap<LocalId, BindingId>,
+    local_captures: ArenaMap<LocalId, DefId>,
 }
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy, Hash)]
@@ -343,10 +344,16 @@ impl MovePathStates {
                     }
                 }
                 for (assigned_path, node) in assigned {
+                    // self.0
+                    //     .entry(*assigned_path)
+                    //     .or_default()
+                    //     .source
+                    //     .merge(&ValueSources(smallvec![*node]));
+
                     self.0.insert(*assigned_path, MovePathState::assign(*node));
                 }
             }
-            NodeStatement::EndScope { move_path, node } => {
+            NodeStatement::EndScope { move_path, .. } => {
                 move_data.for_each_child_path(*move_path, |path| {
                     if let Some(state) = self.0.get_mut(path) {
                         state.reset();
@@ -377,7 +384,7 @@ pub fn walk_thir_body<'a>(
 
     let body = db.mir_body(owner.into()).unwrap();
     let body_walker = MirBodyWalker::new(thir_builder, &body, db);
-    body_walker.walk(&mut graph, None, Some(thir_builder.return_def()));
+    body_walker.walk(&mut graph, None, Some(thir_builder.return_binding()));
     graph
 }
 
@@ -401,7 +408,7 @@ impl<'a> MirBodyWalker<'a> {
             .collect::<ArenaMap<LocalId, BindingId>>();
 
         let mut locations = Arena::new();
-        let block_locations = mir_body
+        let block_locations: ArenaMap<BasicBlockId, BasicBlockLocationMap> = mir_body
             .basic_blocks
             .iter()
             .map(|(bb_id, bb)| {
@@ -428,6 +435,39 @@ impl<'a> MirBodyWalker<'a> {
             })
             .collect();
 
+        // this is a bit of a workaround, to link locals captured by a closure to the proper DefId
+        let mut local_captures: ArenaMap<LocalId, DefId> = ArenaMap::new();
+        for (block_id, block) in mir_body.basic_blocks.iter() {
+            for (stmnt, loc) in block
+                .statements
+                .iter()
+                .zip_eq(block_locations[block_id].statements.iter().copied())
+            {
+                match (&stmnt.kind, locations[loc].0) {
+                    (
+                        StatementKind::Assign(
+                            _,
+                            Rvalue::Aggregate(hir_ty::mir::AggregateKind::Closure(_), ops),
+                        ),
+                        Some(closure_def),
+                    ) => {
+                        if !matches!(thir_builder[closure_def], Def::Expr(Expr::Closure { .. })) {
+                            println!("Closure capture does not originate from closure def!?");
+                        }
+                        for op in ops.iter() {
+                            match op {
+                                Operand::Copy(place) | Operand::Move(place) => {
+                                    local_captures.insert(place.local, closure_def);
+                                }
+                                _ => (),
+                            }
+                        }
+                    }
+                    _ => (),
+                }
+            }
+        }
+
         let move_data = MoveData::new(mir_body, db);
         MirBodyWalker {
             thir_builder,
@@ -439,6 +479,7 @@ impl<'a> MirBodyWalker<'a> {
             param_locations,
             binding_locals,
             local_bindings,
+            local_captures,
             crate_id,
         }
     }
@@ -456,7 +497,7 @@ impl<'a> MirBodyWalker<'a> {
         &self,
         graph: &mut Graph,
         captures: Option<&[(MovePathId, NodeId)]>,
-        ret_def: Option<DefId>,
+        ret_def: Option<BindingId>,
     ) {
         let statements = self.graph_statements(graph, captures, ret_def);
 
@@ -522,7 +563,7 @@ impl<'a> MirBodyWalker<'a> {
         &self,
         graph: &mut Graph,
         captures: Option<&[(MovePathId, NodeId)]>,
-        ret_def: Option<DefId>,
+        ret_binding: Option<BindingId>,
     ) -> ArenaMap<LocationId, NodeStatement> {
         enum PlaceProjection {
             Deref(NodeId, bool),
@@ -587,17 +628,16 @@ impl<'a> MirBodyWalker<'a> {
 
         let place_to_lvalue =
             |graph: &mut Graph, place: &Place, location: LocationId, usages: &mut Usages| {
-                let binding = self.place_binding(place);
+                let binding = self.place_binding(place).or_else(|| {
+                    if place.local == Self::RETURN_LOCAL {
+                        ret_binding
+                    } else {
+                        None
+                    }
+                });
                 let span = binding
                     .and_then(|id| self.find_assignment(location, id))
-                    .map(|id| self.find_path(id))
-                    .or_else(|| {
-                        if place.local == Self::RETURN_LOCAL {
-                            ret_def
-                        } else {
-                            None
-                        }
-                    });
+                    .map(|id| self.find_path(id));
                 match project_place(graph, span, place, usages, binding) {
                     PlaceProjection::Deref(node, _) => (node, smallvec![]),
                     PlaceProjection::MovePath(move_path) => {
@@ -690,24 +730,27 @@ impl<'a> MirBodyWalker<'a> {
             let closure_body = self.db.mir_body_for_closure(closure).unwrap();
             let walker = MirBodyWalker::new(self.thir_builder, &closure_body, self.db);
 
-            let (capture_def, ret_def) = span
+            let (capture_binding, capture_def, ret_binding) = span
                 .and_then(|id| match self.thir_builder[id] {
                     Def::Expr(Expr::Closure {
+                        capture_binding,
                         capture_dummy,
-                        return_dummy,
+                        return_binding,
                         ..
-                    }) => Some((capture_dummy, return_dummy)),
+                    }) => Some((capture_binding, capture_dummy, return_binding)),
                     _ => None,
                 })
-                .unzip();
+                .map(|(a, b, c)| (Some(a), Some(b), Some(c)))
+                .unwrap_or((None, None, None));
             let capture_path = walker.move_data.move_path_for(Self::CAPTURE_LOCAL);
-            let root_node = graph.alloc(NodeKind::Place(None, true), capture_def);
-            graph.connect_lifetimes(lvalue_node, root_node);
+            let root_node = graph.alloc(NodeKind::Place(capture_binding, true), capture_def);
+            graph.create_lifetime_for_node(root_node, capture_path, &walker.move_data);
 
             let mut capture_assignments = vec![(capture_path, root_node)];
             for (proj, child_path) in walker.move_data.children(capture_path) {
                 match proj {
                     ProjectionKind::Deref => {
+                        // FIXME: without proper lt-support, we can not distinguish the lts of different closure captures, when capturing by ref
                         break;
                     }
                     ProjectionKind::ClosureField(index) => {
@@ -722,11 +765,12 @@ impl<'a> MirBodyWalker<'a> {
                             capture_def,
                         ));
                     }
-                    _ => panic!(),
+                    _ => println!("Non closure field projection in closure!"),
                 }
             }
+            graph.connect_lifetimes(lvalue_node, root_node);
 
-            walker.walk(graph, Some(&capture_assignments), ret_def);
+            walker.walk(graph, Some(&capture_assignments), ret_binding);
         };
 
         for (block_id, block) in self.mir_body.basic_blocks.iter() {
@@ -736,10 +780,10 @@ impl<'a> MirBodyWalker<'a> {
                 .zip_eq(self.block_locations[block_id].statements.iter().copied())
             {
                 match &stmnt.kind {
-                    StatementKind::Assign(place, value) => {
+                    StatementKind::Assign(lvalue, value) => {
                         let mut usages = vec![];
                         let (lvalue_node, assigned) =
-                            place_to_lvalue(graph, place, loc, &mut usages);
+                            place_to_lvalue(graph, lvalue, loc, &mut usages);
                         match value {
                             Rvalue::Use(op)
                             | Rvalue::Repeat(op, _)
@@ -803,7 +847,14 @@ impl<'a> MirBodyWalker<'a> {
                                 }
                             },
                             Rvalue::Ref(kind, place) => {
-                                let span = self.find_op_usage(loc, place, BindingUsageHint::None);
+                                let span = if let Some(closure_def) =
+                                    self.local_captures.get(lvalue.local)
+                                {
+                                    Some(*closure_def) // if the assigned place, is captured by a closure afterwards, we use the DefId of the closure
+                                } else {
+                                    self.find_op_usage(loc, place, BindingUsageHint::None)
+                                };
+
                                 let kind = match kind {
                                     BorrowKind::Shared | BorrowKind::Shallow => {
                                         EdgeKind::Ref(false)
@@ -1066,7 +1117,7 @@ impl<'a> MirBodyWalker<'a> {
                                         .iter_sources()
                                         .filter_map(|source| match graph.nodes[source].kind {
                                             NodeKind::Place(binding, _) => binding.and_then(|id| {
-                                                (!self.thir_builder[id].marked_mutable)
+                                                (!self.thir_builder.marked_mut(id))
                                                     .then_some(source)
                                             }),
                                             NodeKind::Deref {
@@ -1115,7 +1166,7 @@ impl<'a> MirBodyWalker<'a> {
                                         if path_state.is_assigned() {
                                             if !path
                                                 .map(|binding| {
-                                                    self.thir_builder[binding].marked_mutable
+                                                    self.thir_builder.marked_mut(binding)
                                                 })
                                                 .unwrap_or(false)
                                             {
@@ -1127,11 +1178,14 @@ impl<'a> MirBodyWalker<'a> {
                                             }
 
                                             for orig_assign in path_state.iter_sources() {
-                                                graph.connect(
-                                                    orig_assign,
-                                                    *assigned,
-                                                    EdgeKind::Reassign,
-                                                );
+                                                // prevent the node from reassigning itself (when inside a loop)
+                                                if orig_assign != *assigned {
+                                                    graph.connect(
+                                                        orig_assign,
+                                                        *assigned,
+                                                        EdgeKind::Reassign,
+                                                    );
+                                                }
                                             }
                                         }
                                     }

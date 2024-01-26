@@ -96,10 +96,11 @@ pub fn boris_view(
 
     let mut insert_or_join = |tree: Tree| {
         if let Some(existing_tree) = trees.iter_mut().find(|existing| {
-            existing
-                .usages
-                .iter()
-                .any(|(_, existing_def)| tree.usages.iter().any(|(_, def)| existing_def == def))
+            existing.binding == tree.binding
+                && existing
+                    .usages
+                    .iter()
+                    .any(|(_, existing_def)| tree.usages.iter().any(|(_, def)| existing_def == def))
         }) {
             existing_tree.merge(&tree);
         } else {

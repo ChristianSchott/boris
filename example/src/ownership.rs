@@ -7,8 +7,6 @@ fn ownership() {
 
     let mine_now = x;
 
-    do_something(x);
-
     {
         let cloned_value = mine_now.clone();
 
