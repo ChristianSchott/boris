@@ -40,7 +40,7 @@ WASM Viewer:
 
 - run `trunk serve` in the `boris_viewer` folder for running the web viewer application locally. More information about deploying can be found [here](https://github.com/emilk/eframe_template#web-locally).
   - the viewer directly embeds pre-analysed function bodies from the `./example/export/bodies/` folder (see `./project/boris_viewer/examples.rs`)
-  - access examples via `url/#example_name` (e.g., https://christianschott.github.io/boris-viewer/#ownership)
+  - access examples via `url/#example_name` (e.g., https://christianschott.github.io/boris-viewer/#ownership or https://christianschott.github.io/boris-viewer/#higher_order_fn)
 
 ## Credits
 
