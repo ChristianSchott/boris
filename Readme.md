@@ -11,7 +11,7 @@ Please consider taking two minutes and filling out the form, it would help a lot
 
 For now it is a standalone program, but IDE integration may be something to look into for the future.
 
-![](/imgs/app_examble.png)
+![](/imgs/app_example.png)
 
 ### [>> Web viewer <<](https://christianschott.github.io/boris-viewer/#ownership)
 

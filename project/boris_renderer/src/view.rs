@@ -1,28 +1,38 @@
-use boris_shared::{BindingId, Def, DefEdgeKind, DefId, DefNode, DefSet, NodeKind, ThirBody};
-use egui::{Context, Pos2, Rect, ScrollArea, Sense, Ui, Vec2};
+use bitvec::vec;
+use boris_shared::{BindingId, BirBody, Def, DefEdgeKind, DefId, DefNode, DefSet, NodeKind};
+use egui::{Context, Pos2, Rect, Sense, Ui, Vec2};
 use la_arena::Arena;
+use smallvec::smallvec;
 
 use crate::{body_drawer, DefLivelinessInfo, DrawBuffer, State, UsageKind};
 
-struct Tree {
-    assignments: Vec<DefId>,
-    usages: Vec<(UsageKind, DefId)>,
+pub struct Tree {
+    pub assignments: Vec<DefId>,
+    pub usages: Vec<(UsageKind, DefId)>,
 
     source_activity: DefSet,
     usage_activity: DefSet,
 
-    binding: BindingId,
-    mutable: bool,
-    has_lt: bool,
+    pub binding: BindingId,
+    pub scope: Option<DefId>,
+    pub mutable: bool,
+    pub has_lt: bool,
 }
 
 impl Tree {
-    fn new(defs: &Arena<Def>, binding: BindingId, mutable: bool, has_lt: bool) -> Self {
+    fn new(
+        defs: &Arena<Def>,
+        binding: BindingId,
+        scope: Option<DefId>,
+        mutable: bool,
+        has_lt: bool,
+    ) -> Self {
         Self {
             assignments: vec![],
             usages: vec![],
             source_activity: DefSet::new(defs),
             usage_activity: DefSet::new(defs),
+            scope,
             binding,
             mutable,
             has_lt,
@@ -77,7 +87,7 @@ impl Tree {
         self.source_activity.or(activity);
     }
 
-    fn activity(&self) -> DefSet {
+    pub fn activity(&self) -> DefSet {
         let mut activity = self.source_activity.clone();
         if self.has_lt {
             activity.and(&self.usage_activity);
@@ -89,19 +99,16 @@ impl Tree {
 pub fn boris_view(
     ctx: &Context,
     ui: &mut Ui,
-    body: &ThirBody,
-    selected_def: &mut Option<DefId>,
+    body: &BirBody,
+    selected_defs: &mut Vec<DefId>,
 ) -> Rect {
     let mut trees: Vec<Tree> = vec![];
 
     let mut insert_or_join = |tree: Tree| {
-        if let Some(existing_tree) = trees.iter_mut().find(|existing| {
-            existing.binding == tree.binding
-                && existing
-                    .usages
-                    .iter()
-                    .any(|(_, existing_def)| tree.usages.iter().any(|(_, def)| existing_def == def))
-        }) {
+        if let Some(existing_tree) = trees
+            .iter_mut()
+            .find(|existing| existing.binding == tree.binding)
+        {
             existing_tree.merge(&tree);
         } else {
             trees.push(tree);
@@ -112,9 +119,10 @@ pub fn boris_view(
                     edges: &[(DefEdgeKind, DefId)],
                     active: &DefSet,
                     binding: BindingId,
+                    scope: Option<DefId>,
                     mutable: bool,
                     has_lt: bool| {
-        let mut tree = Tree::new(&body.defs, binding, mutable, has_lt);
+        let mut tree = Tree::new(&body.defs, binding, scope, mutable, has_lt);
         tree.add_source(def, active);
         for (kind, to) in edges {
             if let Some(DefNode { active, .. }) = body.def_graph.get(*to) {
@@ -132,44 +140,56 @@ pub fn boris_view(
                     binding,
                     mutable,
                     contains_lt,
+                    scope,
                 },
             edges,
             active,
         }) = body.def_graph.get(def)
         {
             // track references to their source (only one level currently..)
-            if let Some(sources) = body.def_graph_inv.get(def) {
-                for source in sources {
-                    if let Some(origins) = body.def_graph_inv.get(*source) {
-                        for origin in origins {
-                            if let Some(DefNode {
-                                kind:
-                                    NodeKind::Source {
-                                        binding,
-                                        mutable,
-                                        contains_lt,
-                                    },
-                                edges,
+            let mut source_defs = vec![def];
+            while let Some(def) = source_defs.pop() {
+                if let Some(sources) = body.def_graph_inv.get(def) {
+                    for source in sources {
+                        if let Some(DefNode {
+                            kind:
+                                NodeKind::Source {
+                                    binding,
+                                    mutable,
+                                    contains_lt,
+                                    scope,
+                                },
+                            edges,
+                            active,
+                        }) = body.def_graph.get(*source)
+                        {
+                            insert_or_join(add_tree(
+                                *source,
+                                &edges,
                                 active,
-                            }) = body.def_graph.get(*origin)
-                            {
-                                insert_or_join(add_tree(
-                                    *origin,
-                                    &edges,
-                                    active,
-                                    *binding,
-                                    *mutable,
-                                    *contains_lt,
-                                ));
-                            }
+                                *binding,
+                                *scope,
+                                *mutable,
+                                *contains_lt,
+                            ));
                         }
                     }
+
+                    source_defs.extend_from_slice(&sources);
                 }
             }
 
             targets.extend(edges.iter().map(|(_, to)| *to));
 
-            let mut tree = add_tree(def, &edges, active, *binding, *mutable, *contains_lt);
+            let mut tree = add_tree(
+                def,
+                &edges,
+                active,
+                *binding,
+                *scope,
+                *mutable,
+                *contains_lt,
+            );
             // if a source node has a direct connection to another source node, then it is a reassignment and we want to include it
             if let Some(sources) = body.def_graph_inv.get(def) {
                 for source in sources {
@@ -191,15 +211,15 @@ pub fn boris_view(
         }
     };
 
-    if let Some(selected) = selected_def.clone() {
-        if !try_add_source_def(selected) {
+    for selected in selected_defs.iter() {
+        if !try_add_source_def(*selected) {
             // when clicking on a usage, find the corresponding source node
             if let Some(DefNode {
                 kind: NodeKind::Usage,
                 ..
-            }) = body.def_graph.get(selected)
+            }) = body.def_graph.get(*selected)
             {
-                if let Some(sources) = body.def_graph_inv.get(selected) {
+                if let Some(sources) = body.def_graph_inv.get(*selected) {
                     for source in sources.iter().cloned() {
                         try_add_source_def(source);
                     }
@@ -225,6 +245,7 @@ pub fn boris_view(
                                     binding,
                                     mutable,
                                     contains_lt,
+                                    scope,
                                 },
                             edges,
                             active,
@@ -244,6 +265,7 @@ pub fn boris_view(
                                 &edges,
                                 active,
                                 *binding,
+                                *scope,
                                 *mutable,
                                 *contains_lt,
                             ));
@@ -262,6 +284,7 @@ pub fn boris_view(
                                                     binding,
                                                     mutable,
                                                     contains_lt,
+                                                    scope,
                                                 },
                                             edges,
                                             active,
@@ -271,6 +294,7 @@ pub fn boris_view(
                                                 &edges,
                                                 active,
                                                 *binding,
+                                                *scope,
                                                 *mutable,
                                                 *contains_lt,
                                             ));
@@ -288,21 +312,11 @@ pub fn boris_view(
         }
     }
 
-    let def_sets = Box::from_iter(trees.into_iter().map(|tree| {
-        (
-            tree.activity(),
-            tree.assignments,
-            tree.usages,
-            tree.binding,
-            tree.mutable,
-        )
-    }));
-    let liveliness_info = DefLivelinessInfo::new(&body.defs, &def_sets);
+    let liveliness_info = DefLivelinessInfo::new(&body.defs, &trees, &body.never_defs);
 
     let state = State::new(
-        selected_def.clone(),
+        selected_defs.clone(),
         liveliness_info,
-        body.never_defs.clone(),
         body.def_order.clone(),
         body.next_def_map.clone(),
     );
@@ -325,11 +339,19 @@ pub fn boris_view(
         ui.input(|input| {
             if let Some(selected_thir) = selected.selected_thir() {
                 if input.pointer.button_clicked(egui::PointerButton::Primary) {
-                    *selected_def = Some(selected_thir);
+                    if input.modifiers.any() {
+                        if !selected_defs.contains(&selected_thir) {
+                            selected_defs.push(selected_thir);
+                        }
+                    } else {
+                        *selected_defs = vec![selected_thir];
+                    }
                 }
             }
-            if input.pointer.button_clicked(egui::PointerButton::Secondary) {
-                *selected_def = None;
+            if input.pointer.button_clicked(egui::PointerButton::Secondary)
+                || input.key_pressed(egui::Key::Escape)
+            {
+                selected_defs.clear();
             }
         });
         response.rect

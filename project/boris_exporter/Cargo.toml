@@ -3,6 +3,9 @@ name = "boris_exporter"
 version = "0.1.0"
 edition = "2021"
 
+[profile.release]
+debug = true
+
 [dependencies]
 boris_shared = { path = "../boris_shared" }
 boris_analysis = { path = "../boris_analysis" }

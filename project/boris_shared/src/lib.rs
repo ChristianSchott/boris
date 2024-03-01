@@ -1,7 +1,4 @@
-use std::{
-    fmt::{Debug, Display},
-    ops::Not,
-};
+use std::fmt::{Debug, Display};
 
 use bitvec::{order::Lsb0, vec::BitVec};
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
@@ -31,7 +28,8 @@ impl Def {
                 | Expr::Literal(_)
                 | Expr::RecordLit { .. }
                 | Expr::Tuple { .. }
-                | Expr::Array(_) => 190,
+                | Expr::Array(_)
+                | Expr::Block { .. } => 190,
                 Expr::MethodCall { .. } => 180,
                 Expr::Field { .. } => 170,
                 Expr::Call { .. } | Expr::Index { .. } => 160,
@@ -57,6 +55,24 @@ impl Def {
             },
             _ => 0,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DefSpan {
+    pub from: DefId,
+    pub to: DefId,
+}
+
+impl DefSpan {
+    pub fn unite(&self, other: &Self, order: &ArenaMap<DefId, u32>) -> Self {
+        let from = (order[other.from] < order[self.from])
+            .then_some(other.from)
+            .unwrap_or(self.from);
+        let to = (order[other.to] > order[self.to])
+            .then_some(other.to)
+            .unwrap_or(self.to);
+        DefSpan { from, to }
     }
 }
 
@@ -99,24 +115,42 @@ pub enum CaptureBy {
 pub enum Expr {
     Path(PathInfo),
     Literal(String),
-    Block {
-        statements: Vec<Statement>,
-        tail: Option<DefId>,
-        scope_start: DefId,
-        scope_end: DefId,
-    },
-    If {
-        condition: DefId,
-        then_branch: DefId,
-        else_branch: Option<DefId>,
-    },
+    Block(Block),
+    // if-let, while-let
     Let {
         pat: DefId,
         expr: DefId,
     },
+    // inside of block statement
+    LetStatement {
+        pat: DefId,
+        type_ref: Option<String>,
+        initializer: Option<DefId>,
+    },
+    Branch {
+        entry_dummy: DefId,
+        arms: Box<[DefId]>,
+        full_defer: bool,
+    },
+    IfArm {
+        else_if: bool,
+        condition: DefId,
+        expr: DefId,
+    },
+    ElseArm {
+        lit_dummy: DefId,
+        expr: DefId,
+    },
     Match {
         expr: DefId,
-        arms: Vec<MatchArm>,
+        branch: DefId,
+    },
+    // MatchArm as separate def, as it is also used as the 'scope'-def of the match arm
+    MatchArm {
+        entry_dummy: DefId,
+        pat: DefId,
+        guard: Option<DefId>,
+        expr: DefId,
     },
     Ref {
         expr: DefId,
@@ -133,12 +167,12 @@ pub enum Expr {
     },
     Call {
         callee: DefId,
-        args: Vec<DefId>,
+        args: Box<[DefId]>,
     },
     MethodCall {
         receiver: DefId,
         fn_name: String,
-        args: Vec<DefId>,
+        args: Box<[DefId]>,
     },
     Field {
         expr: DefId,
@@ -159,7 +193,7 @@ pub enum Expr {
     },
     RecordLit {
         path: String,
-        fields: Vec<(String, DefId)>,
+        fields: Box<[(String, DefId)]>,
         spread: Option<DefId>,
         ellipsis: bool,
     },
@@ -167,12 +201,12 @@ pub enum Expr {
         expr: Option<DefId>,
     },
     Tuple {
-        exprs: Vec<DefId>,
+        exprs: Box<[DefId]>,
     },
     Closure {
         capture_binding: BindingId,
         capture_dummy: DefId,
-        args: Vec<DefId>,
+        args: Box<[DefId]>,
         body_expr: DefId,
         capture_by: CaptureBy,
         return_dummy: DefId,
@@ -208,23 +242,31 @@ pub enum Pat {
         mutability: Mutability,
     },
     Or {
-        patterns: Vec<DefId>,
+        patterns: Box<[DefId]>,
     },
     Tuple {
-        pats: Vec<DefId>,
+        pats: Box<[DefId]>,
         dots: Option<usize>,
     },
     Record {
         path: String,
-        args: Vec<(String, DefId)>,
+        args: Box<[(String, DefId)]>,
         ellipsis: bool,
     },
     TupleStruct {
         path: String,
-        args: Vec<DefId>,
+        args: Box<[DefId]>,
         ellipsis: Option<usize>,
     },
     Unimplemented,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Block {
+    pub statements: Box<[DefId]>,
+    pub tail: Option<DefId>,
+    pub scope_start: DefId,
+    pub scope_end: DefId,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Copy, Serialize, Deserialize)]
@@ -232,19 +274,6 @@ pub enum BindingAnnotation {
     Mutable,
     Ref,
     RefMut,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub enum Statement {
-    Let {
-        pat: DefId,
-        type_ref: Option<String>,
-        initializer: Option<DefId>,
-        else_branch: Option<DefId>,
-    },
-    Expr {
-        expr: DefId,
-    },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -256,7 +285,7 @@ pub struct MatchArm {
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Array {
-    ElementList { elements: Vec<DefId> },
+    ElementList { elements: Box<[DefId]> },
     Repeat { initializer: DefId, repeat: DefId },
 }
 
@@ -339,17 +368,6 @@ impl DefSet {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DataFlowTree {
-    pub binding: BindingId,
-    pub initialization: Vec<DefId>,
-    pub usages: Vec<(DefId, DependencyKind, SmallVec<[DataFlowTreeId; 1]>)>,
-    pub liveliness: DefSet,
-    pub is_mut: bool,
-    pub has_ref: bool,
-}
-pub type DataFlowTreeId = Idx<DataFlowTree>;
-
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub enum ConflictKind {
     Moved,
@@ -357,6 +375,7 @@ pub enum ConflictKind {
     AssignToValueBehindImmutableRef,
     MoveOutOfRef,
     UseOfUnassigned,
+    UseOfMaybeUnassigned,
     MutRefToImmutable,
 }
 
@@ -373,6 +392,7 @@ impl Display for ConflictKind {
             ConflictKind::MutRefToImmutable => {
                 "Creating an mutable reference to an immutable value."
             }
+            ConflictKind::UseOfMaybeUnassigned => "Use of value, which may be unassigned.",
         })
     }
 }
@@ -381,13 +401,6 @@ impl Display for ConflictKind {
 pub struct Conflict {
     pub kind: ConflictKind,
     pub targets: Vec<DefId>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct DataFlowInfo {
-    pub tree: Arena<DataFlowTree>,
-    pub def_map: ArenaMap<DefId, SmallVec<[DataFlowTreeId; 1]>>,
-    pub conflicts: Vec<Conflict>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -401,12 +414,14 @@ pub struct ForLoopResugaring {
     pub pat: DefId,
     pub iterable: DefId,
     pub body: DefId,
+    pub scope: DefId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WhileLoopResugaring {
     pub condition: DefId,
     pub body: DefId,
+    pub scope: DefId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -423,11 +438,15 @@ pub enum Resugaring {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ThirBody {
+pub struct BirBody {
     pub name: String,
-    pub params: Vec<(DefId, String)>,
+    pub params: Box<[(DefId, String)]>,
     pub return_type: (DefId, String),
     pub body_expr: DefId,
+
+    // for now this is just an empty def, which could be used for displaying lts from the outer scope.
+    // this also ensures that the first function argument, is not the first def
+    pub world_scope: DefId,
 
     pub defs: Arena<Def>,
     pub bindings: Arena<Binding>,
@@ -450,6 +469,7 @@ pub enum NodeKind {
         binding: BindingId,
         mutable: bool,
         contains_lt: bool,
+        scope: Option<DefId>,
     },
     Usage,
 }
@@ -474,6 +494,6 @@ pub struct DefNode {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExampleState {
-    pub body: ThirBody,
+    pub body: BirBody,
     pub selected: Option<DefId>,
 }

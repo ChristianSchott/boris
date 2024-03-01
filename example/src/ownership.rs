@@ -1,7 +1,5 @@
 fn do_something(text: String) {}
 
-fn log(a: String, b: String) {}
-
 fn ownership() {
     let x = String::from("Hello world");
 

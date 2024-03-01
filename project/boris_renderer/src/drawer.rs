@@ -1,14 +1,14 @@
 use std::{
     collections::HashMap,
     f32::consts::PI,
-    iter,
-    ops::{BitAnd, BitOr},
+    ops::{BitAnd, BitOr, Not},
     sync::Arc,
 };
 
 use bitvec::{prelude::BitArray, prelude::Lsb0};
 use boris_shared::{
-    BinaryOp, BindingAnnotation, BindingId, Conflict, Def, DefId, DefSet, Mutability, UnaryOp,
+    BinaryOp, BindingAnnotation, BindingId, Conflict, Def, DefId, DefSet, DefSpan, Mutability,
+    UnaryOp,
 };
 use eframe::{
     egui::{self, Margin, Painter},
@@ -20,12 +20,13 @@ use eframe::{
 };
 use egui::{
     epaint::{Hsva, PathShape},
-    Align2, Rgba,
+    Align2,
 };
 use itertools::Itertools;
 use la_arena::{Arena, ArenaMap, Idx};
-use smallvec::SmallVec;
 use tuple::{self, Map};
+
+use crate::view::Tree;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Liveliness(BitArray<[u32; 1], Lsb0>);
@@ -62,6 +63,10 @@ impl Liveliness {
         Self(self.0.bitor(other.0))
     }
 
+    pub fn inverted(&self) -> Self {
+        Self(self.0.not())
+    }
+
     pub fn index_for(&self, lane: LaneIndex) -> u32 {
         (self.0.split_at(lane.0 as usize).0.count_ones() + 1) as u32
     }
@@ -83,7 +88,7 @@ pub enum UsageKind {
 #[derive(Debug, Clone)]
 pub struct DefLivelinessInfo {
     def_liveliness: Box<[Liveliness]>, // which lanes are active for each def_id
-    lane_binding: Box<[(BindingId, bool, bool)]>,
+    lane_binding: Box<[(f32, bool, bool, Option<DefId>)]>,
     active_defs: ArenaMap<DefId, (Vec<LaneIndex>, Vec<(LaneIndex, UsageKind)>)>, // assignments & usages
     used: u32,
 }
@@ -97,21 +102,18 @@ impl LaneIndex {
 }
 
 impl DefLivelinessInfo {
-    pub fn new(
-        defs: &Arena<Def>,
-        def_sets: &[(DefSet, Vec<DefId>, Vec<(UsageKind, DefId)>, BindingId, bool)],
-    ) -> DefLivelinessInfo {
-        assert!(Liveliness::ZERO.0.len() >= def_sets.len()); // ensure bit-array has enough capacity
+    pub fn new(defs: &Arena<Def>, trees: &[Tree], never_defs: &DefSet) -> DefLivelinessInfo {
+        assert!(Liveliness::ZERO.0.len() >= trees.len()); // ensure bit-array has enough capacity
         let lane = |index: usize| LaneIndex::from_raw(index as u32);
 
         let mut active_defs: ArenaMap<DefId, (Vec<LaneIndex>, Vec<(LaneIndex, UsageKind)>)> =
             ArenaMap::new();
-        for (index, (_, assignments, def_usages, _, _)) in def_sets.iter().enumerate() {
-            for assign_def in assignments {
+        for (index, tree) in trees.iter().enumerate() {
+            for assign_def in tree.assignments.iter() {
                 let (assignments, _) = active_defs.entry(*assign_def).or_default();
                 assignments.push(lane(index));
             }
-            for (kind, usage_def) in def_usages {
+            for (kind, usage_def) in tree.usages.iter() {
                 let (_, usages) = active_defs.entry(*usage_def).or_default();
                 usages.push((lane(index), *kind));
             }
@@ -120,17 +122,23 @@ impl DefLivelinessInfo {
         let mut info = DefLivelinessInfo {
             def_liveliness: Box::from_iter(std::iter::repeat(Liveliness::ZERO).take(defs.len())),
             active_defs,
-            used: def_sets.len() as u32,
-            lane_binding: Box::from_iter(def_sets.iter().map(
-                |(activity, .., binding, mutability)| (*binding, *mutability, activity.any()),
-            )),
+            used: trees.len() as u32,
+            lane_binding: Box::from_iter(trees.iter().map(|tree| {
+                (
+                    Self::hash(tree.binding),
+                    tree.mutable,
+                    tree.activity().any(),
+                    tree.scope,
+                )
+            })),
         };
-        for (index, (def_set, ..)) in def_sets.iter().enumerate() {
+        for (index, tree) in trees.iter().enumerate() {
             let index = lane(index);
-            for (def_id, active) in def_set.iter() {
+            for (def_id, active) in tree.activity().iter() {
                 info.def_liveliness[def_id.into_raw().into_u32() as usize].set(index, active);
             }
         }
+        // TODO: disable never defs..
         info
     }
 
@@ -196,19 +204,32 @@ impl DefLivelinessInfo {
         self.lane_binding[index.0 as usize].2
     }
 
-    fn hash(&self, index: LaneIndex) -> f32 {
+    pub fn lane_owner(&self, index: LaneIndex) -> Option<DefId> {
+        self.lane_binding[index.0 as usize].3
+    }
+
+    // return type `Liveliness` is a bit misleading here.. as it is more of a LaneMask
+    pub fn lanes_for_owner(&self, owner: DefId) -> Liveliness {
+        let mut mask = Liveliness::default();
+        for (lane, (.., lane_owner)) in self.lane_binding.iter().enumerate() {
+            mask.set(LaneIndex::from_raw(lane as u32), *lane_owner == Some(owner));
+        }
+        mask
+    }
+
+    fn hash(binding: BindingId) -> f32 {
         const OFFSET: f32 = -PI * 0.5f32;
         const MUL: f32 = 42f32;
-        let id = self.lane_binding[index.0 as usize].0.into_raw().into_u32();
+        let id = binding.into_raw().into_u32();
         ((id as f32 * MUL + OFFSET).sin() + 1.) / 2f32
     }
 
     pub fn color(&self, index: LaneIndex) -> Color32 {
-        Hsva::new(self.hash(index), 1.0f32, 0.65f32, 1f32).into()
+        Hsva::new(self.lane_binding[index.0 as usize].0, 1.0f32, 0.65f32, 1f32).into()
     }
 
     pub fn locked_color(&self, index: LaneIndex) -> Color32 {
-        Hsva::new(self.hash(index), 0.95f32, 0.4f32, 1f32).into()
+        Hsva::new(self.lane_binding[index.0 as usize].0, 0.95f32, 0.4f32, 1f32).into()
     }
 
     pub fn stroke(&self, locked: bool, index: LaneIndex) -> Stroke {
@@ -227,69 +248,117 @@ impl DefLivelinessInfo {
 
 #[derive(Clone)]
 pub struct State {
-    pub selected: Option<DefId>,
+    pub selected: Vec<DefId>,
     pub liveliness: DefLivelinessInfo,
 
     // FIXME: this does not belong in here..
-    pub never_defs: DefSet,
     pub order: ArenaMap<DefId, u32>,
     pub first_def: ArenaMap<DefId, DefId>,
 }
 
 impl State {
     pub fn new(
-        selected: Option<DefId>,
+        selected: Vec<DefId>,
         liveliness: DefLivelinessInfo,
-        never_defs: DefSet,
         order: ArenaMap<DefId, u32>,
         first_def: ArenaMap<DefId, DefId>,
     ) -> Self {
         Self {
             selected,
             liveliness,
-            never_defs,
             order,
             first_def,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct DefSpan {
-    pub from: DefId,
-    pub to: DefId,
+#[derive(Clone, Debug)]
+pub enum CFKind {
+    // TODO: Box<[]> the vecs
+    // TODO: make real types out of these tuples..
+    Line(
+        Vec<(LaneIndex, RelativeDrawCallId, DefId, bool)>, // assignments
+        Vec<(LaneIndex, RelativeDrawCallId, DefId, UsageKind, bool)>, // usages
+    ), // active defs
+    Closure(Vec<(LaneIndex, RelativeDrawCallId, DefId, UsageKind, bool)>), // active defs
+    Branch(
+        Box<[(RelativeDrawCallId, DefSpan)]>,
+        bool, /* full defer? */
+    ),
 }
 
-impl DefSpan {
-    pub fn unite(&self, other: &Self, order: &ArenaMap<DefId, u32>) -> Self {
-        let from = (order[other.from] < order[self.from])
-            .then_some(other.from)
-            .unwrap_or(self.from);
-        let to = (order[other.to] > order[self.to])
-            .then_some(other.to)
-            .unwrap_or(self.to);
-        DefSpan { from, to }
+impl CFKind {
+    fn offset(&self, offset: Vec2) -> CFKind {
+        fn offset_usages(
+            from: &[(LaneIndex, RelativeDrawCallId, DefId, UsageKind, bool)],
+            offset: Vec2,
+        ) -> Vec<(LaneIndex, RelativeDrawCallId, DefId, UsageKind, bool)> {
+            from.iter()
+                .map(|(lane, call, id, kind, handled)| {
+                    (*lane, call.offset(offset), *id, *kind, *handled)
+                })
+                .collect_vec()
+        }
+
+        match self {
+            CFKind::Branch(branches, full) => CFKind::Branch(
+                Box::from_iter(
+                    branches
+                        .iter()
+                        .map(|(call, span)| (call.offset(offset), *span)),
+                ),
+                *full,
+            ),
+            CFKind::Closure(captures) => CFKind::Closure(offset_usages(&captures, offset)),
+            CFKind::Line(assignment, usages) => CFKind::Line(
+                assignment
+                    .iter()
+                    .map(|(lane, call, id, handled)| (*lane, call.offset(offset), *id, *handled))
+                    .collect_vec(),
+                offset_usages(&usages, offset),
+            ),
+        }
+    }
+
+    fn filter(&self, handled: Liveliness) -> CFKind {
+        // this is just ugly, but it works..
+        match self {
+            CFKind::Line(assigned, used) => CFKind::Line(
+                assigned
+                    .iter()
+                    .cloned()
+                    .map(|mut usage| {
+                        usage.3 |= handled.is_live(usage.0);
+                        usage
+                    })
+                    .collect_vec(),
+                used.iter()
+                    .cloned()
+                    .map(|mut usage| {
+                        usage.4 |= handled.is_live(usage.0);
+                        usage
+                    })
+                    .collect_vec(),
+            ),
+            CFKind::Closure(captures) => CFKind::Closure(
+                captures
+                    .iter()
+                    .cloned()
+                    .map(|mut usage| {
+                        usage.4 |= handled.is_live(usage.0);
+                        usage
+                    })
+                    .collect_vec(),
+            ),
+            kind => kind.clone(),
+        }
     }
 }
 
 #[derive(Clone, Debug)]
-pub enum CFKind {
-    Line(Vec<(LaneIndex, DefId)>, Vec<(LaneIndex, DefId, UsageKind)>), // active defs
-    Closure(Vec<(LaneIndex, DefId, UsageKind)>),                       // active defs
-    Branch(f32, f32, Box<[(f32, DefSpan)]>, bool /* full defer? */),
-}
-
-fn snap(x: f32) -> f32 {
-    x.floor() + 0.5f32
-}
-fn snap_pos(pos: Pos2) -> Pos2 {
-    pos2(snap(pos.x), snap(pos.y))
-}
-
-#[derive(Clone, Debug)]
 pub struct CFSections {
-    start: DefId,
-    sections: Box<[(CFKind, DefId, f32)]>,
+    liveliness: Liveliness,
+    sections: Box<[(f32, Liveliness, CFKind)]>,
 }
 
 impl CFSections {
@@ -297,35 +366,19 @@ impl CFSections {
         &self,
         origin: Pos2,
         offset: Vec2,
-    ) -> impl Iterator<Item = (CFKind, DefSpan, Pos2, Pos2)> + '_ {
+    ) -> impl Iterator<Item = (CFKind, Liveliness, Liveliness, Pos2, Pos2)> + '_ {
         self.sections.iter().scan(
-            (0f32, self.start),
-            move |(start_y, start_def), (kind, end_def, end_y)| {
-                let kind = match kind {
-                    CFKind::Branch(from_y, to_y, branches, full) => CFKind::Branch(
-                        snap(*from_y + origin.y + offset.y + 1f32 /* not sure why, but otherwise there is a gap */),
-                        snap(*to_y + origin.y + offset.y),
-                        Box::from_iter(
-                            branches
-                                .iter()
-                                .map(|(x, span)| (snap(origin.x + offset.x + *x), *span)),
-                        ),
-                        *full,
-                    ),
-                    old_kind => old_kind.clone(),
-                };
-
+            (0f32, self.liveliness),
+            move |(start_y, from_liveliness), (end_y, liveliness, kind)| {
                 let ret = (
-                    kind,
-                    DefSpan {
-                        from: *start_def,
-                        to: *end_def,
-                    },
-                    snap_pos(origin + Vec2::DOWN * *start_y),
-                    snap_pos(origin + Vec2::DOWN * *end_y),
+                    kind.offset(origin.to_vec2() + offset),
+                    from_liveliness.clone(),
+                    liveliness.clone(),
+                    origin + offset + Vec2::DOWN * *start_y,
+                    origin + offset + Vec2::DOWN * *end_y,
                 );
                 *start_y = *end_y;
-                *start_def = *end_def;
+                *from_liveliness = *liveliness;
                 Some(ret)
             },
         )
@@ -337,12 +390,14 @@ pub enum DrawCallKind {
     Text(Arc<Galley>, Color32),
     Rect(Color32, Rounding),
     Bracketed(BracketType, Color32, f32),
-    ControlFlow(CFSections, Vec2),
 
     Inline(Box<[RelativeDrawCallId]>),
     Branch(Box<[RelativeDrawCallId]>, DefSpan, bool),
     Sequential(Box<[RelativeDrawCallId]>),
+    ControlFlow(CFSections, RelativeDrawCallId, Option<DefId>),
     Closure(DrawCallId, DefId),
+
+    Alias(DrawCallId, Box<[DefId]>),
 
     #[default]
     Noop,
@@ -421,6 +476,7 @@ pub enum TextLitKind {
     Box,
     Fn,
     Arrow,
+    WideArrow,
     Range(bool),
     BinaryOp(BinaryOp),
     UnaryOp(UnaryOp),
@@ -428,6 +484,7 @@ pub enum TextLitKind {
     BindingAnnotation(BindingAnnotation),
     RoundBracket(bool),
     SquareBracket(bool),
+    CurlyBracket(bool),
     Pipe,
     QuestionMark,
 }
@@ -444,7 +501,6 @@ pub struct DrawBuffer<'a> {
 impl<'a> DrawBuffer<'a> {
     const LINE_WIDTH: f32 = 1f32;
     const LINE_SEP: f32 = 5f32;
-    pub const INDENT: f32 = 5f32;
 
     pub fn new(ctx: &'a egui::Context) -> Self {
         Self {
@@ -459,7 +515,9 @@ impl<'a> DrawBuffer<'a> {
 
     fn append(&mut self, draw_call: DrawCall) -> DrawCallId {
         let is_complex = match &draw_call.kind {
-            DrawCallKind::Branch(..) | DrawCallKind::Sequential(..) => true,
+            DrawCallKind::Branch(..)
+            | DrawCallKind::Sequential(..)
+            | DrawCallKind::ControlFlow(..) => true,
             _ => false,
         };
         let id = self.buffer.alloc(draw_call);
@@ -467,9 +525,6 @@ impl<'a> DrawBuffer<'a> {
         // is complex itself, or contains any complex draw calls in its direct children
         let complex_child = || -> bool {
             self.walk_children(id, &mut |call| {
-                // if matches!(self.buffer[call.id].kind, DrawCallKind::Closure(..)) {
-                //     TreeWalkerState::Continue
-                // } else
                 if let Some(is_complex) = self.call_complexity.get(call.id) {
                     if *is_complex {
                         TreeWalkerState::Return(())
@@ -488,101 +543,125 @@ impl<'a> DrawBuffer<'a> {
     }
 
     pub fn assoc_def_id(&mut self, call_id: DrawCallId, def_id: DefId) {
-        self.def_map.insert(call_id, (def_id, false));
-    }
-
-    pub fn fake_assoc_def_id(&mut self, call_id: DrawCallId, def_id: DefId) {
-        self.def_map.insert(call_id, (def_id, true));
-    }
-
-    pub fn literal(&mut self, kind: TextLitKind) -> DrawCallId {
-        if let Some(cache) = self.text_lit_drawers.get(&kind) {
-            *cache
-        } else {
-            const SYMBOL_COLOR: Color32 = Color32::BLACK;
-            const KEYWORD_COLOR: Color32 = Color32::DARK_BLUE;
-            let mut append_lit = |lit: &str, color: Color32| {
-                let galley = text_literal(self.ctx, lit);
-                let size = galley.size();
-                self.append(DrawCall {
-                    kind: DrawCallKind::Text(galley, color),
-                    size,
-                })
-            };
-            // FIXME: consistent use of space vs no-space
-            match kind {
-                TextLitKind::Comma => append_lit(", ", SYMBOL_COLOR),
-                TextLitKind::Dot => append_lit(".", SYMBOL_COLOR),
-                TextLitKind::Dots => append_lit("…", SYMBOL_COLOR),
-                TextLitKind::Semi => append_lit(";", SYMBOL_COLOR),
-                TextLitKind::QuestionMark => append_lit("?", SYMBOL_COLOR),
-                TextLitKind::Let => append_lit("let ", KEYWORD_COLOR),
-                TextLitKind::For => append_lit("for ", KEYWORD_COLOR),
-                TextLitKind::In => append_lit(" in ", KEYWORD_COLOR),
-                TextLitKind::If => append_lit("if ", KEYWORD_COLOR),
-                TextLitKind::Then => append_lit("then", KEYWORD_COLOR),
-                TextLitKind::Else => append_lit("else", KEYWORD_COLOR),
-                TextLitKind::Match => append_lit("match ", KEYWORD_COLOR),
-                TextLitKind::While => append_lit("while ", KEYWORD_COLOR),
-                TextLitKind::Loop => append_lit("loop", KEYWORD_COLOR),
-                TextLitKind::Move => append_lit("move ", KEYWORD_COLOR),
-                TextLitKind::Box => append_lit("box ", KEYWORD_COLOR),
-                TextLitKind::Fn => append_lit("fn ", KEYWORD_COLOR),
-                TextLitKind::Space => append_lit(" ", SYMBOL_COLOR),
-                TextLitKind::Tab => append_lit("\t", SYMBOL_COLOR),
-                TextLitKind::At => append_lit(" @ ", SYMBOL_COLOR),
-                TextLitKind::Under => append_lit("_", SYMBOL_COLOR),
-                TextLitKind::Arrow => append_lit("-> ", SYMBOL_COLOR),
-                TextLitKind::BinaryOp(op) => append_lit(&format!(" {} ", op), SYMBOL_COLOR),
-                TextLitKind::UnaryOp(op) => append_lit(
-                    match op {
-                        UnaryOp::Deref => "*",
-                        UnaryOp::Not => "!",
-                        UnaryOp::Neg => "-",
-                    },
-                    SYMBOL_COLOR,
-                ),
-                TextLitKind::Ref(mutable) => append_lit(
-                    match mutable {
-                        Mutability::Shared => "&",
-                        Mutability::Mut => "&mut ",
-                    },
-                    SYMBOL_COLOR,
-                ),
-                TextLitKind::BindingAnnotation(annotation) => match annotation {
-                    BindingAnnotation::Mutable => append_lit("mut ", KEYWORD_COLOR),
-                    BindingAnnotation::Ref => append_lit("ref ", KEYWORD_COLOR),
-                    BindingAnnotation::RefMut => append_lit("ref mut ", KEYWORD_COLOR),
-                },
-                TextLitKind::Return => append_lit("return", KEYWORD_COLOR),
-                TextLitKind::Break => append_lit("break ", KEYWORD_COLOR),
-                TextLitKind::Tick => append_lit("'", SYMBOL_COLOR),
-                TextLitKind::Colon => append_lit(":", SYMBOL_COLOR),
-                TextLitKind::Range(inclusive) => {
-                    append_lit(if inclusive { "..=" } else { ".." }, SYMBOL_COLOR)
-                }
-                TextLitKind::Continue => append_lit("continue", KEYWORD_COLOR),
-                TextLitKind::RoundBracket(open) => {
-                    if open {
-                        append_lit("(", SYMBOL_COLOR)
-                    } else {
-                        append_lit(")", SYMBOL_COLOR)
-                    }
-                }
-                TextLitKind::SquareBracket(open) => {
-                    if open {
-                        append_lit("[", SYMBOL_COLOR)
-                    } else {
-                        append_lit("]", SYMBOL_COLOR)
-                    }
-                }
-                TextLitKind::Pipe => append_lit("|", SYMBOL_COLOR),
-            }
+        if self.def_map.insert(call_id, (def_id, false)).is_some() {
+            println!("Double associate Def: {:?}", self.buffer[call_id].kind);
         }
     }
 
+    pub fn fake_assoc_def_id(&mut self, call_id: DrawCallId, def_id: DefId) {
+        if self.def_map.insert(call_id, (def_id, true)).is_some() {
+            println!("Double associate Def: {:?}", self.buffer[call_id].kind);
+        }
+    }
+
+    pub fn append_literal(&mut self, kind: TextLitKind) -> DrawCallId {
+        const SYMBOL_COLOR: Color32 = Color32::BLACK;
+        const KEYWORD_COLOR: Color32 = Color32::DARK_BLUE;
+        let mut append_lit = |lit: &str, color: Color32| {
+            let galley = text_literal(self.ctx, lit);
+            let size = galley.size();
+            self.append(DrawCall {
+                kind: DrawCallKind::Text(galley, color),
+                size,
+            })
+        };
+        // FIXME: consistent use of space vs no-space
+        match kind {
+            TextLitKind::Comma => append_lit(", ", SYMBOL_COLOR),
+            TextLitKind::Dot => append_lit(".", SYMBOL_COLOR),
+            TextLitKind::Dots => append_lit("…", SYMBOL_COLOR),
+            TextLitKind::Semi => append_lit(";", SYMBOL_COLOR),
+            TextLitKind::QuestionMark => append_lit("?", SYMBOL_COLOR),
+            TextLitKind::Let => append_lit("let ", KEYWORD_COLOR),
+            TextLitKind::For => append_lit("for ", KEYWORD_COLOR),
+            TextLitKind::In => append_lit(" in ", KEYWORD_COLOR),
+            TextLitKind::If => append_lit("if ", KEYWORD_COLOR),
+            TextLitKind::Then => append_lit("then", KEYWORD_COLOR),
+            TextLitKind::Else => append_lit("else", KEYWORD_COLOR),
+            TextLitKind::Match => append_lit("match ", KEYWORD_COLOR),
+            TextLitKind::While => append_lit("while ", KEYWORD_COLOR),
+            TextLitKind::Loop => append_lit("loop", KEYWORD_COLOR),
+            TextLitKind::Move => append_lit("move ", KEYWORD_COLOR),
+            TextLitKind::Box => append_lit("box ", KEYWORD_COLOR),
+            TextLitKind::Fn => append_lit("fn ", KEYWORD_COLOR),
+            TextLitKind::Space => append_lit(" ", SYMBOL_COLOR),
+            TextLitKind::Tab => append_lit("\t", SYMBOL_COLOR),
+            TextLitKind::At => append_lit(" @ ", SYMBOL_COLOR),
+            TextLitKind::Under => append_lit("_", SYMBOL_COLOR),
+            TextLitKind::Arrow => append_lit("-> ", SYMBOL_COLOR),
+            TextLitKind::WideArrow => append_lit(" =>", SYMBOL_COLOR),
+            TextLitKind::BinaryOp(op) => append_lit(&format!(" {} ", op), SYMBOL_COLOR),
+            TextLitKind::UnaryOp(op) => append_lit(
+                match op {
+                    UnaryOp::Deref => "*",
+                    UnaryOp::Not => "!",
+                    UnaryOp::Neg => "-",
+                },
+                SYMBOL_COLOR,
+            ),
+            TextLitKind::Ref(mutable) => append_lit(
+                match mutable {
+                    Mutability::Shared => "&",
+                    Mutability::Mut => "&mut ",
+                },
+                SYMBOL_COLOR,
+            ),
+            TextLitKind::BindingAnnotation(annotation) => match annotation {
+                BindingAnnotation::Mutable => append_lit("mut ", KEYWORD_COLOR),
+                BindingAnnotation::Ref => append_lit("ref ", KEYWORD_COLOR),
+                BindingAnnotation::RefMut => append_lit("ref mut ", KEYWORD_COLOR),
+            },
+            TextLitKind::Return => append_lit("return", KEYWORD_COLOR),
+            TextLitKind::Break => append_lit("break ", KEYWORD_COLOR),
+            TextLitKind::Tick => append_lit("'", SYMBOL_COLOR),
+            TextLitKind::Colon => append_lit(":", SYMBOL_COLOR),
+            TextLitKind::Range(inclusive) => {
+                append_lit(if inclusive { "..=" } else { ".." }, SYMBOL_COLOR)
+            }
+            TextLitKind::Continue => append_lit("continue", KEYWORD_COLOR),
+            TextLitKind::RoundBracket(open) => {
+                if open {
+                    append_lit("(", SYMBOL_COLOR)
+                } else {
+                    append_lit(")", SYMBOL_COLOR)
+                }
+            }
+            TextLitKind::SquareBracket(open) => {
+                if open {
+                    append_lit("[", SYMBOL_COLOR)
+                } else {
+                    append_lit("]", SYMBOL_COLOR)
+                }
+            }
+            TextLitKind::CurlyBracket(open) => {
+                if open {
+                    append_lit("{", SYMBOL_COLOR)
+                } else {
+                    append_lit("}", SYMBOL_COLOR)
+                }
+            }
+            TextLitKind::Pipe => append_lit("|", SYMBOL_COLOR),
+        }
+    }
+
+    pub fn cached_literal(&mut self, kind: TextLitKind) -> DrawCallId {
+        if let Some(cache) = self.text_lit_drawers.get(&kind) {
+            *cache
+        } else {
+            let lit = self.append_literal(kind);
+            self.text_lit_drawers.insert(kind, lit);
+            lit
+        }
+    }
+
+    pub fn id_literal(&mut self, kind: TextLitKind, id: DefId) -> DrawCallId {
+        let call = self.append_literal(kind);
+        self.assoc_def_id(call, id);
+        call
+    }
+
     pub fn space(&mut self) -> DrawCallId {
-        self.literal(TextLitKind::Space)
+        self.cached_literal(TextLitKind::Space)
     }
 
     pub fn space_width(&mut self) -> f32 {
@@ -604,6 +683,15 @@ impl<'a> DrawBuffer<'a> {
         let size = galley.size();
         self.append(DrawCall {
             kind: DrawCallKind::Text(galley, color),
+            size,
+        })
+    }
+
+    pub fn append_alias(&mut self, alias: &str, defs: &[DefId]) -> DrawCallId {
+        let text = self.append_str(&alias);
+        let size = self.size(text);
+        self.append(DrawCall {
+            kind: DrawCallKind::Alias(text, defs.into()),
             size,
         })
     }
@@ -631,6 +719,17 @@ impl<'a> DrawBuffer<'a> {
         self.append_inline(
             Box::from([RelativeDrawCallId::new(call_id, margin.left_top())]),
             size,
+        )
+    }
+
+    pub fn indent(&mut self, call_id: DrawCallId) -> DrawCallId {
+        let indent = self.space_width(); // * 2f32;
+        self.append_spaced(
+            call_id,
+            Margin {
+                left: indent,
+                ..Default::default()
+            },
         )
     }
 
@@ -662,27 +761,24 @@ impl<'a> DrawBuffer<'a> {
         let max_size = self.max_size(children.iter().cloned());
         let mut reserved = 0f32;
         let children = Box::from_iter(children.iter().cloned().map(|mut id| {
-            // for complex calls (like branches), this is already taken care of by the child
-            if !self.is_complex(id) {
-                // make space for usage indicators
-                let (assignments, usages) =
-                    self.find_usages(RelativeDrawCallId::root(id), &state.liveliness);
-                let (in_count, out_count) = (usages.len(), assignments.len());
-                if in_count > 0 || out_count > 0 {
-                    let offset = |count| {
-                        (count > 0)
-                            .then_some((count + 1) as f32 * Self::LINE_SEP)
-                            .unwrap_or(0f32)
-                    }; // TODO: move this calc somewhere
-                    id = self.append_spaced(
-                        id,
-                        Margin {
-                            top: offset(in_count),
-                            bottom: offset(out_count),
-                            ..Default::default()
-                        },
-                    );
-                }
+            // make space for usage indicators
+            let (assignments, usages) =
+                self.find_usages(RelativeDrawCallId::root(id), &state.liveliness);
+            let (in_count, out_count) = (usages.len(), assignments.len());
+            if in_count > 0 || out_count > 0 {
+                let offset = |count| {
+                    (count > 0)
+                        .then_some((count + 1) as f32 * Self::LINE_SEP)
+                        .unwrap_or(0f32)
+                }; // TODO: move this calc somewhere
+                id = self.append_spaced(
+                    id,
+                    Margin {
+                        top: offset(in_count),
+                        bottom: offset(out_count),
+                        ..Default::default()
+                    },
+                );
             }
 
             let call = RelativeDrawCallId::new(
@@ -707,46 +803,61 @@ impl<'a> DrawBuffer<'a> {
         &mut self,
         child_id: DrawCallId,
         from_def: DefId,
+        scope: Option<DefId>,
         state: &State,
     ) -> DrawCallId {
         let sequence = self.sections(child_id, from_def, state);
+        let lane_mask = scope
+            .map(|owner| state.liveliness.lanes_for_owner(owner))
+            .unwrap_or_else(|| Liveliness::ZERO.inverted());
         let max_live_per_section = sequence
             .iter(Pos2::ZERO, Vec2::ZERO)
-            .fold(0, |acc, (_, span, _, _)| {
-                acc.max(state.liveliness.liveliness_for(span).live_count())
+            .fold(0, |acc, (_, from, to, ..)| {
+                acc.max(from.and(&to).and(&lane_mask).live_count())
             });
-        let offset = Vec2::RIGHT * (max_live_per_section + 1) as f32 * Self::LINE_SEP;
+        let offset = Vec2::RIGHT * max_live_per_section as f32 * Self::LINE_SEP;
         let call = RelativeDrawCallId::new(child_id, offset);
         let size = self.size(child_id) + offset + Vec2::RIGHT * Self::LINE_SEP;
-        let cf_call = self.append(DrawCall {
-            kind: DrawCallKind::ControlFlow(sequence, offset),
+        self.append(DrawCall {
+            kind: DrawCallKind::ControlFlow(sequence, call, scope),
             size,
-        });
-        self.append_inline([call, RelativeDrawCallId::root(cf_call)].into(), size)
+        })
     }
 
     pub fn append_branched(
         &mut self,
-        branches: &[DrawCallId],
+        branches: &[(DrawCallId, DefId)],
         span: DefSpan,
         full_cf_defer: bool,
         state: &State,
     ) -> DrawCallId {
-        let (max_live_entry, max_live_exit) = (
+        let (mut max_live_entry, mut max_live_exit) = (
             state.liveliness.count_live_at(span.from),
             state.liveliness.count_live_at(span.to),
         );
+        if max_live_entry > 0 {
+            max_live_entry += 1;
+        }
+        if max_live_exit > 0 {
+            max_live_exit += 1;
+        }
 
-        let max_height = self.max_size(branches.iter().copied()).y;
-        let y_offset = (max_live_entry + 2) as f32 * Self::LINE_SEP;
-        let y_offset_exit = (max_live_exit + 2) as f32 * Self::LINE_SEP;
-        let mut cursor = Self::INDENT;
-        let branches = Box::from_iter(branches.iter().map(|branch_id| {
+        let max_height = self.max_size(branches.iter().map(|(id, _)| *id)).y;
+        let y_offset = max_live_entry as f32 * Self::LINE_SEP;
+        let y_offset_exit = max_live_exit as f32 * Self::LINE_SEP;
+        let mut cursor = 0f32;
+        let branches = Box::from_iter(branches.iter().map(|(branch_id, from_def)| {
             let branch_size = vec2(self.size(*branch_id).x, max_height);
             self.set_size(*branch_id, branch_size);
-            let branch_id = self.append_linear_control_flow(*branch_id, span.from, state);
+            let mut branch_id = self.append_boxed(
+                *branch_id,
+                Margin::ZERO,
+                Rounding::same(10f32),
+                Color32::from_black_alpha(10),
+            );
+            branch_id = self.append_linear_control_flow(branch_id, *from_def, None, state);
             let offset = vec2(cursor, y_offset);
-            cursor += self.size(branch_id).x;
+            cursor += self.size(branch_id).x + Self::LINE_SEP;
             RelativeDrawCallId::new(branch_id, offset)
         }));
 
@@ -815,8 +926,12 @@ impl<'a> DrawBuffer<'a> {
                     TextLitKind::SquareBracket(false),
                 ),
                 BracketType::Pipe => (TextLitKind::Pipe, TextLitKind::Pipe),
+                BracketType::Curly => (
+                    TextLitKind::CurlyBracket(true),
+                    TextLitKind::CurlyBracket(false),
+                ),
             };
-            let (open, close) = (self.literal(open), self.literal(close));
+            let (open, close) = (self.cached_literal(open), self.cached_literal(close));
             self.append_horizontal(&[open, child_id, close], false)
         }
     }
@@ -828,25 +943,12 @@ impl<'a> DrawBuffer<'a> {
         inner_id: DefId,
         state: &State,
     ) -> DrawCallId {
-        let call_id = self.append_linear_control_flow(call_id, inner_id, state);
+        let call_id = self.append_linear_control_flow(call_id, inner_id, Some(inner_id), state);
         let size = self.size(call_id);
-        let call_id = self.append(DrawCall {
+        self.append(DrawCall {
             kind: DrawCallKind::Closure(call_id, outer_id),
             size,
-        });
-        self.assoc_def_id(call_id, outer_id);
-        let active_captures_count = self.active_count(call_id, &state.liveliness);
-        if active_captures_count > 0 {
-            self.append_spaced(
-                call_id,
-                Margin {
-                    top: (active_captures_count + 1) as f32 * Self::LINE_SEP, // TODO: move this calc somewhere
-                    ..Default::default()
-                },
-            )
-        } else {
-            call_id
-        }
+        })
     }
 
     pub fn is_complex(&self, call_id: DrawCallId) -> bool {
@@ -857,24 +959,37 @@ impl<'a> DrawBuffer<'a> {
         &self,
         call: RelativeDrawCallId,
         liveliness: &DefLivelinessInfo,
-    ) -> (Vec<(LaneIndex, DefId)>, Vec<(LaneIndex, DefId, UsageKind)>) {
+    ) -> (
+        Vec<(LaneIndex, RelativeDrawCallId, DefId, bool)>,
+        Vec<(LaneIndex, RelativeDrawCallId, DefId, UsageKind, bool)>,
+    ) {
         let (mut assignments, mut usages): (Vec<_>, Vec<_>) = Default::default();
-        self.walk_children(call.id, &mut |child| {
-            if let Some((def_id, false)) = self.def_map.get(child.id) {
-                for lane in liveliness.assignments_for(*def_id).unwrap_or_default() {
-                    if liveliness.is_lane_active(*lane) {
-                        // only show assignments for lanes that are actually used..
-                        assignments.push((*lane, *def_id));
-                    }
-                }
-                for (lane, kind) in liveliness.usages_for(*def_id).unwrap_or_default() {
-                    usages.push((*lane, *def_id, *kind));
+        let mut visit_def = |child: RelativeDrawCallId, def_id: DefId| {
+            for lane in liveliness.assignments_for(def_id).unwrap_or_default() {
+                if liveliness.is_lane_active(*lane) {
+                    // only show assignments for lanes that are actually used..
+                    assignments.push((*lane, child.offset(call.offset), def_id, false));
                 }
             }
+            for (lane, kind) in liveliness.usages_for(def_id).unwrap_or_default() {
+                usages.push((*lane, child.offset(call.offset), def_id, *kind, false));
+            }
+        };
+
+        self.walk_children(call.id, &mut |child| {
+            if let Some((def_id, false)) = self.def_map.get(child.id) {
+                visit_def(child, *def_id);
+            }
             match &self.buffer[child.id].kind {
-                DrawCallKind::Closure(..) | DrawCallKind::Branch(..) => {
+                DrawCallKind::Alias(_, defs) => {
+                    for def in defs.iter() {
+                        visit_def(child, *def);
+                    }
                     TreeWalkerState::<()>::Continue
                 }
+                DrawCallKind::Closure(..)
+                | DrawCallKind::Branch(..)
+                | DrawCallKind::Sequential(..) => TreeWalkerState::<()>::Continue,
                 _ => TreeWalkerState::DescendToChildren,
             }
         });
@@ -904,40 +1019,49 @@ impl<'a> DrawBuffer<'a> {
 
         let mut stack = vec![RelativeDrawCallId::root(call_id)];
         while let Some(top_call) = stack.pop() {
-            let mut push_section = |kind: CFKind, def: DefId| {
-                sections.push((kind, def, top_call.offset.y + self.size(top_call.id).y));
+            let mut push_section = |kind: CFKind, liveliness: Liveliness| {
+                sections.push((
+                    top_call.offset.y + self.size(top_call.id).y,
+                    liveliness,
+                    kind,
+                ));
             };
             if self.is_complex(top_call.id) {
                 match &self.buffer[top_call.id].kind {
                     DrawCallKind::Branch(branches, span, full_cf_defer) => {
-                        let (start_y, height) =
-                            branches.iter().fold((0f32, 0f32), |(y, height), branch| {
-                                (y.max(branch.offset.y), height.max(self.size(branch.id).y))
-                            });
-                        let start_y = start_y + top_call.offset.y;
                         push_section(
                             CFKind::Branch(
-                                start_y,
-                                start_y + height,
                                 Box::from_iter(branches.iter().filter_map(|branch| {
                                     self.find_def_span(branch.id, &state.order, &state.first_def)
-                                        .map(|span| (top_call.offset.x + branch.offset.x, span))
+                                        .map(|span| (branch.offset(top_call.offset), span))
                                 })),
                                 *full_cf_defer,
                             ),
-                            span.to,
+                            state.liveliness.liveliness_at(span.to),
                         );
                     }
                     DrawCallKind::Closure(_, def_id) => {
-                        // let captures = state
-                        //     .liveliness
-                        //     .activity_for(*def_id)
-                        //     .iter()
-                        //     .map(|(lane, kind)| ( *lane,*def_id, *kind))
-                        //     .collect();
                         let (assignments, captures) = self.find_usages(top_call, &state.liveliness);
                         assert!(assignments.len() == 0);
-                        push_section(CFKind::Closure(captures), *def_id)
+                        push_section(
+                            CFKind::Closure(captures),
+                            state.liveliness.liveliness_at(*def_id),
+                        )
+                    }
+                    DrawCallKind::ControlFlow(inner, child_call, owner) => {
+                        let handled = owner
+                            .map(|owner| state.liveliness.lanes_for_owner(owner))
+                            .unwrap_or_else(|| Liveliness::ZERO);
+
+                        for (kind, _, liveliness, _, to) in
+                            inner.iter(top_call.offset.to_pos2(), child_call.offset)
+                        {
+                            sections.push((
+                                to.y,
+                                liveliness.and(&handled.inverted()),
+                                kind.filter(handled),
+                            ));
+                        }
                     }
                     _ => {
                         let mut push = |child: RelativeDrawCallId| {
@@ -971,23 +1095,23 @@ impl<'a> DrawBuffer<'a> {
                 if let Some(span) = self.find_def_span(top_call.id, &state.order, &state.first_def)
                 {
                     let (assignments, usages) = self.find_usages(top_call, &state.liveliness);
-                    push_section(CFKind::Line(assignments, usages), span.to);
-                } else {
-                    // this may occur for the else-lit in an if-else-chain
-                    // println!("section without def-span! {:?}", self.buffer[child.id].kind);
+                    push_section(
+                        CFKind::Line(assignments, usages),
+                        state.liveliness.liveliness_at(span.to),
+                    );
                 }
             }
         }
 
         let end_y = self.size(call_id).y;
-        if let Some((_, to, last_end_y)) = sections.last() {
+        if let Some((last_end_y, liveliness, _)) = sections.last() {
             if *last_end_y != end_y {
-                sections.push((CFKind::Line(vec![], vec![]), *to, end_y))
+                sections.push((end_y, *liveliness, CFKind::Line(vec![], vec![])))
             }
         }
 
         CFSections {
-            start: from_def,
+            liveliness: state.liveliness.liveliness_at(from_def),
             sections: sections.into_boxed_slice(),
         }
     }
@@ -1025,12 +1149,14 @@ impl<'a> DrawBuffer<'a> {
                 TreeWalkerState::Stop => return None,
                 TreeWalkerState::Return(val) => return Some(val),
                 TreeWalkerState::DescendToChildren => match &self.buffer[top_call.id].kind {
-                    DrawCallKind::Closure(id, _) => push(&[RelativeDrawCallId::root(*id)]),
+                    DrawCallKind::Alias(id, ..) | DrawCallKind::Closure(id, ..) => {
+                        push(&[RelativeDrawCallId::root(*id)])
+                    }
+                    DrawCallKind::ControlFlow(_, id, _) => push(&[*id]),
                     DrawCallKind::Branch(children, ..)
                     | DrawCallKind::Inline(children)
                     | DrawCallKind::Sequential(children) => push(&children),
                     DrawCallKind::Bracketed(..)
-                    | DrawCallKind::ControlFlow(..)
                     | DrawCallKind::Text(..)
                     | DrawCallKind::Rect(..)
                     | DrawCallKind::Noop => (),
@@ -1089,12 +1215,14 @@ impl<'a> DrawBuffer<'a> {
         &self,
         painter: &Painter,
         sequence: &CFSections,
+        scope: Option<DefId>,
         rect: Rect,
         content_offset: Vec2,
         state: &State,
-        def_rects: &ArenaMap<DefId, Rect>,
     ) {
-        let inactive = Stroke::new(Self::LINE_WIDTH, Color32::DARK_GRAY);
+        let handled_lanes = scope
+            .map(|scope| state.liveliness.lanes_for_owner(scope))
+            .unwrap_or_else(|| Liveliness::ZERO.inverted());
 
         let lane_offset = |index: u32| Self::LINE_SEP * index as f32;
         let lane_stroke = |lane: LaneIndex, liveliness: &Liveliness| -> Stroke {
@@ -1103,9 +1231,13 @@ impl<'a> DrawBuffer<'a> {
 
         let origin = rect.left_top();
 
-        for (kind, span, from, to) in sequence.iter(origin, content_offset) {
+        let draw_call_rect = |call: RelativeDrawCallId| -> Rect {
+            Rect::from_min_size(call.offset.to_pos2(), self.size(call.id))
+        };
+
+        for (kind, live_entry, live_exit, from, to) in sequence.iter(origin, content_offset) {
             let (live_entry, live_exit) =
-                (span.from, span.to).map(|def| state.liveliness.liveliness_at(def));
+                (live_entry, live_exit).map(|liveliness| liveliness.and(&handled_lanes));
 
             let join_pos = |lane: LaneIndex, index: usize, kind: UsageKind| -> Pos2 {
                 let index = match kind {
@@ -1113,51 +1245,46 @@ impl<'a> DrawBuffer<'a> {
                     _ => index + 1,
                 };
                 snap_pos(
-                    from + Vec2::DOWN * (index as f32 * Self::LINE_SEP)
+                    pos2(origin.x, from.y)
+                        + Vec2::DOWN * (index as f32 * Self::LINE_SEP)
                         + Vec2::RIGHT * lane_offset(live_entry.index_for(lane)),
                 )
             };
 
             if !matches!(kind, CFKind::Branch(.., true)) {
-                if !state.never_defs[span.from] {
-                    painter.line_segment([from, to], inactive)
-                }
                 for lane in live_entry.iter_live() {
                     let stroke = lane_stroke(lane, &live_entry);
                     let (lane_index_entry, lane_index_exit) =
                         (&live_entry, &live_exit).map(|live| live.index_for(lane));
                     let lane_changed = lane_index_entry != lane_index_exit;
 
-                    let mut entry_pos = from + Vec2::RIGHT * lane_offset(lane_index_entry);
-                    let exit_pos = to + Vec2::RIGHT * lane_offset(lane_index_exit);
+                    let mut entry_pos = snap_pos(
+                        pos2(origin.x, from.y) + Vec2::RIGHT * lane_offset(lane_index_entry),
+                    );
+                    let exit_pos =
+                        snap_pos(pos2(origin.x, to.y) + Vec2::RIGHT * lane_offset(lane_index_exit));
 
                     let moved = if let CFKind::Line(_, usages) | CFKind::Closure(usages) = &kind {
                         if let Some((last_index, kind)) = usages.iter().enumerate().rev().find_map(
-                            |(index, (usage_lane, _, kind))| {
-                                (*usage_lane == lane).then_some((index, *kind))
+                            |(index, (usage_lane, .., kind, handled))| {
+                                (*usage_lane == lane && !*handled).then_some((index, *kind))
                             },
                         ) {
                             let pos = join_pos(lane, last_index, kind);
                             painter.line_segment([entry_pos, pos], stroke); // extend straight line until last usage
                             entry_pos = pos;
                         }
-                        usages.iter().any(|(usage_lane, _, kind)| {
-                            *usage_lane == lane && matches!(kind, UsageKind::Move(false))
+                        usages.iter().any(|(usage_lane, .., kind, handled)| {
+                            *usage_lane == lane
+                                && matches!(kind, UsageKind::Move(false))
+                                && !*handled
                         })
                     } else {
                         false
                     };
 
-                    let assigned = if let CFKind::Line(assignments, _) = &kind {
-                        assignments
-                            .iter()
-                            .any(|(assigned_lane, _)| *assigned_lane == lane)
-                    } else {
-                        false
-                    };
-
-                    let live_exit = live_exit.is_live(lane) && !state.never_defs[span.from];
-                    if live_exit && !moved && !assigned {
+                    let live_exit = live_exit.is_live(lane);
+                    if live_exit && !moved {
                         if lane_changed {
                             let mid_y = snap((entry_pos.y + exit_pos.y) * 0.5f32);
                             painter.add(bezier4(
@@ -1177,43 +1304,26 @@ impl<'a> DrawBuffer<'a> {
                 }
             }
 
-            if let CFKind::Branch(from_y, to_y, branches, _) = &kind {
+            if let CFKind::Branch(branches, _) = &kind {
                 let (count_entry, count_exit) = (live_entry, live_exit).map(|l| l.live_count() + 1);
-
-                // draw cf lane for entry
-                draw_spread(
-                    painter,
-                    from,
-                    snap(*from_y),
-                    branches.iter().map(|(x, _)| *x),
-                    from.y + lane_offset(count_entry),
-                    inactive,
-                );
-
-                // filter out branches that end with a never type
-                draw_spread(
-                    painter,
-                    to,
-                    snap(*to_y),
-                    branches
-                        .iter()
-                        .filter_map(|(x, span)| (!state.never_defs[span.to]).then_some(*x)),
-                    to.y - lane_offset(count_exit),
-                    inactive,
-                );
 
                 // draw active lanes for entry/exit
                 for (index, lane) in live_entry.iter_live().enumerate() {
+                    let from_y = branches.iter().fold(0f32, |init, (call, _)| {
+                        draw_call_rect(*call).top().max(init)
+                    });
+
                     draw_spread(
                         painter,
-                        from + Vec2::RIGHT * lane_offset(index as u32 + 1),
-                        snap(*from_y),
+                        snap_pos(
+                            pos2(origin.x, from.y) + Vec2::RIGHT * lane_offset(index as u32 + 1),
+                        ),
+                        snap(from_y + Vec2::DOWN.y),
                         branches.iter().filter_map(|(x, span)| {
                             let liveliness = state.liveliness.liveliness_at(span.from);
-                            let active = liveliness.is_live(lane) && !state.never_defs[span.from];
-                            active.then_some({
+                            liveliness.is_live(lane).then_some({
                                 let lane_index = liveliness.index_for(lane);
-                                *x + lane_offset(lane_index)
+                                snap(draw_call_rect(*x).left() + lane_offset(lane_index))
                             })
                         }),
                         from.y + lane_offset(count_entry - index as u32 - 1),
@@ -1221,16 +1331,20 @@ impl<'a> DrawBuffer<'a> {
                     );
                 }
                 for (index, lane) in live_exit.iter_live().enumerate() {
+                    let to_y = branches.iter().fold(0f32, |init, (call, _)| {
+                        draw_call_rect(*call).bottom().max(init)
+                    });
                     draw_spread(
                         painter,
-                        to + Vec2::RIGHT * lane_offset(index as u32 + 1),
-                        snap(*to_y),
+                        snap_pos(
+                            pos2(origin.x, to.y) + Vec2::RIGHT * lane_offset(index as u32 + 1),
+                        ),
+                        snap(to_y),
                         branches.iter().filter_map(|(x, span)| {
                             let liveliness = state.liveliness.liveliness_at(span.to);
-                            let active = liveliness.is_live(lane) && !state.never_defs[span.to];
-                            active.then_some({
+                            liveliness.is_live(lane).then_some({
                                 let lane_index = liveliness.index_for(lane);
-                                *x + lane_offset(lane_index)
+                                snap(draw_call_rect(*x).left() + lane_offset(lane_index))
                             })
                         }),
                         to.y - lane_offset(count_exit - index as u32 - 1),
@@ -1240,10 +1354,16 @@ impl<'a> DrawBuffer<'a> {
             }
 
             if let CFKind::Line(_, usages) | CFKind::Closure(usages) = &kind {
-                for (index, (lane, def, usage_kind)) in usages.iter().cloned().enumerate() {
+                for (index, (lane, call, _, usage_kind, handled)) in
+                    usages.iter().cloned().enumerate()
+                {
+                    if !handled_lanes.is_live(lane) || handled {
+                        continue;
+                    }
+
                     let stroke = lane_stroke(lane, &live_entry);
 
-                    let usage_rect = def_rects[def];
+                    let usage_rect = draw_call_rect(call);
                     let usage_pos = snap_pos(
                         matches!(kind, CFKind::Closure(..))
                             .then_some(usage_rect.left_top() + Vec2::RIGHT * Self::LINE_SEP)
@@ -1289,12 +1409,17 @@ impl<'a> DrawBuffer<'a> {
                     }
                 }
             }
-
             if let CFKind::Line(assignments, _) = &kind {
-                for (index, (lane, def)) in assignments.iter().cloned().enumerate() {
+                for (index, (lane, call, .., handled)) in assignments.iter().cloned().enumerate() {
+                    if !handled_lanes.is_live(lane) || handled {
+                        continue;
+                    }
+
                     let stroke = lane_stroke(lane, &live_exit);
-                    let assign_pos = snap_pos(def_rects[def].center_bottom());
-                    let join_pos = to + Vec2::RIGHT * lane_offset(live_exit.index_for(lane));
+                    let assign_pos = snap_pos(draw_call_rect(call).center_bottom());
+                    let join_pos = snap_pos(
+                        pos2(origin.x, to.y) + Vec2::RIGHT * lane_offset(live_exit.index_for(lane)),
+                    );
                     let line_y = assign_pos.y + (index + 1) as f32 * Self::LINE_SEP;
                     draw_arc(painter, join_pos, line_y, assign_pos, stroke);
                 }
@@ -1320,14 +1445,26 @@ impl<'a> DrawBuffer<'a> {
             let kind = &self.buffer[top.id].kind;
             let rect = Rect::from_min_size(rect.left_top() + top.offset, self.size(top.id));
 
+            // visualized draw calls
+            // painter.rect_filled(
+            //     rect,
+            //     Rounding::ZERO,
+            //     Hsva::new(
+            //         (top.id.into_raw().into_u32() * 10 + depth) as f32 * 0.03f32 % 1f32,
+            //         0.8f32,
+            //         0.9f32,
+            //         0.6f32,
+            //     ),
+            // );
+
             if let Some((def, _)) = self.def_map.get(top.id).copied() {
                 def_rects.insert(def, rect);
 
-                if state.selected == Some(def) {
+                if state.selected.contains(&def) {
                     painter.rect_filled(
-                        rect.expand(2f32),
+                        rect,
                         Rounding::same(2f32),
-                        Color32::LIGHT_YELLOW,
+                        Color32::from_rgba_unmultiplied(255, 255, 100, 100),
                     );
                 }
 
@@ -1355,8 +1492,8 @@ impl<'a> DrawBuffer<'a> {
                 DrawCallKind::Rect(color, rounding) => {
                     painter.rect_filled(rect, *rounding, *color);
                 }
-                DrawCallKind::ControlFlow(sections, offset) => {
-                    self.draw_linear(painter, &sections, rect, *offset, state, &def_rects);
+                DrawCallKind::ControlFlow(sections, child_call, scope) => {
+                    self.draw_linear(painter, &sections, *scope, rect, child_call.offset, state);
                 }
                 _ => (),
             }
@@ -1366,12 +1503,23 @@ impl<'a> DrawBuffer<'a> {
                 DrawCallKind::Closure(id, _) => {
                     if let Some(highlight) = highlight {
                         painter.rect_stroke(
-                            rect.expand(1f32),
+                            rect.shrink(1f32),
                             Rounding::ZERO,
                             Stroke::new(Self::LINE_WIDTH, highlight),
                         );
                     }
                     stack.push((RelativeDrawCallId::new(*id, top.offset), depth + 1, None));
+                }
+                DrawCallKind::Alias(alias, defs) => stack.push((
+                    RelativeDrawCallId::new(*alias, top.offset),
+                    depth + 1,
+                    defs.iter()
+                        .find_map(|def| state.liveliness.lane_for_def(*def))
+                        .map(|lane| state.liveliness.color(lane))
+                        .or(highlight),
+                )),
+                DrawCallKind::ControlFlow(_, child, _) => {
+                    stack.push((child.offset(top.offset), depth + 1, highlight))
                 }
                 DrawCallKind::Branch(children, ..)
                 | DrawCallKind::Inline(children)
@@ -1424,6 +1572,14 @@ impl<'a> DrawBuffer<'a> {
 
         selected
     }
+}
+
+fn snap(x: f32) -> f32 {
+    x.floor() + 0.5f32
+}
+
+fn snap_pos(pos: Pos2) -> Pos2 {
+    pos2(snap(pos.x), snap(pos.y))
 }
 
 fn bezier3(a: Pos2, b: Pos2, c: Pos2, stroke: Stroke) -> Shape {
@@ -1577,6 +1733,7 @@ pub enum BracketType {
     Round,
     Square,
     Pipe,
+    Curly,
 }
 
 impl BracketType {
@@ -1603,7 +1760,7 @@ impl BracketType {
                 Color32::TRANSPARENT,
                 stroke,
             )),
-            BracketType::Square => Shape::line(points.to_vec(), stroke),
+            BracketType::Curly | BracketType::Square => Shape::line(points.to_vec(), stroke),
             BracketType::Pipe => {
                 let dir = (points[1] - points[0].to_vec2()).to_vec2() * 0.5;
                 Shape::line_segment([points[0] + dir, points[3] + dir], stroke)

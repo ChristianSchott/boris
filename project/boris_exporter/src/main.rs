@@ -33,17 +33,30 @@ impl Item {
 }
 
 fn main() -> Result<(), ErrorKind> {
-    let survey_examples = [
+    let examples = [
+        // survey
         Item::new("ownership", "ownership", Some("x")),
         Item::new("copy", "fibonacci", Some("n")),
         Item::new("mutability", "mutability", Some("sum")),
         Item::new("borrowing", "borrowing", Some("owned_string")),
         Item::new("higher_order_fn", "higher_order_functions_example", None),
+        // thesis
+        Item::new("rustviz_struct_lt", "main", Some("n")),
+        Item::new("rustviz_nll_different", "main", Some("x")),
+        Item::new("rustviz_hatra", "main", Some("s")),
+        Item::new("aquascope_ref_aliasing", "ref_aliasing", Some("v")),
+        Item::new("rustlive_listing_four", "main", Some("x")),
+        Item::new(
+            "interior_mutability",
+            "interior_mutability",
+            Some("ref_cell"),
+        ),
+        Item::new("lt_annotation_limit", "lt_annotations", Some("world")),
+        Item::new("closure_capture", "closure_capture_ref", Some("x")),
+        Item::new("lt_annotation_test", "main", Some("x")),
     ];
-
-    let export_items = survey_examples.clone();
-
-    let capture_items = survey_examples.clone();
+    let export_items = examples.clone();
+    let capture_items = examples.clone();
 
     let path_str = format!("{}\\..\\..\\example\\", env!("CARGO_MANIFEST_DIR"));
     let project_path = std::path::Path::new(&path_str)
@@ -131,7 +144,7 @@ fn analyze(analysis: &Analysis, item: &Item) -> Result<ExampleState, ErrorKind> 
         .ok_or(ErrorKind::FnNotFound)?;
 
     let body = analysis
-        .thir_body(func_id)
+        .bir_body(func_id)
         .ok_or(ErrorKind::AnalysisFailed)?;
 
     let selected = item.select.as_ref().and_then(|select| {

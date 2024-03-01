@@ -1,10 +1,10 @@
-use boris_shared::{DefId, ExampleState, ThirBody};
+use boris_shared::{BirBody, DefId, ExampleState};
 use egui::Rect;
 
 pub struct CaptureApp {
     directory: String,
     examples: Vec<(String, ExampleState)>,
-    drawer: Option<(String, ThirBody, Option<DefId>)>,
+    drawer: Option<(String, BirBody, Vec<DefId>)>,
     rect: Rect,
 }
 
@@ -14,7 +14,7 @@ impl CaptureApp {
         examples: Vec<(String, ExampleState)>,
         directory: String,
     ) -> Self {
-        cc.egui_ctx.set_zoom_factor(2f32);
+        cc.egui_ctx.set_zoom_factor(1.5f32);
         CaptureApp {
             directory,
             examples,
@@ -32,7 +32,7 @@ impl eframe::App for CaptureApp {
                     name,
                     state.body.clone(),
                     // boris_renderer::main_body_renderer(ctx, &state.body),
-                    state.selected,
+                    state.selected.into_iter().collect(),
                 ));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
             } else {

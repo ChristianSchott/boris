@@ -1,10 +1,10 @@
 use boris_analysis::{Analysis, Function, FunctionId, ProjectModule};
-use boris_shared::{ExampleState, ThirBody};
+use boris_shared::{BirBody, ExampleState};
 use eframe::egui::{self};
 use egui::{
     ahash::{HashMap, RandomState},
     text::{LayoutJob, TextWrapping},
-    Color32, FontId, TextEdit, Ui,
+    Color32, FontId, Key, TextEdit, Ui,
 };
 
 use std::{
@@ -21,7 +21,7 @@ pub enum UserMessage {
 }
 
 pub enum AnalysisResult {
-    Data((FunctionId, ThirBody, Option<String>)),
+    Data((FunctionId, BirBody, Option<String>)),
     ProjectStructure(Box<[ProjectModule]>),
     Error(String),
 }
@@ -83,7 +83,7 @@ impl AnalysisThread {
         let Some(analysis) = &self.analysis else {
             return AnalysisResult::Error(String::from("No open cargo project."));
         };
-        let body = analysis.thir_body(function_id);
+        let body = analysis.bir_body(function_id);
         body.map(|body| {
             AnalysisResult::Data((function_id, body, analysis.function_source(function_id)))
         })
@@ -106,16 +106,16 @@ enum AppMode {
 }
 
 struct BodyDrawer {
-    body: ThirBody,
-    selected_def: Option<boris_shared::DefId>,
+    body: BirBody,
+    selected_defs: Vec<boris_shared::DefId>,
     source_code: Option<String>,
 }
 
 impl BodyDrawer {
-    fn new(ctx: &egui::Context, body: ThirBody, source_code: Option<String>) -> Self {
+    fn new(ctx: &egui::Context, body: BirBody, source_code: Option<String>) -> Self {
         BodyDrawer {
             body,
-            selected_def: None,
+            selected_defs: Default::default(),
             source_code,
         }
     }
@@ -125,7 +125,7 @@ impl BodyDrawer {
     fn export(&self) -> Result<String, String> {
         let state = ExampleState {
             body: self.body.clone(),
-            selected: self.selected_def,
+            selected: self.selected_defs.first().cloned(),
         };
         let json = serde_json::to_string(&state).map_err(|e| e.to_string())?;
         std::fs::create_dir_all(Self::EXPORT_ROOT_DIR).map_err(|e| e.to_string())?;
@@ -266,6 +266,9 @@ impl eframe::App for MirVisApp {
                         .hint_text("filter..")
                         .desired_width(width),
                 );
+                if ui.input(|i| i.key_pressed(Key::Escape)) {
+                    self.fn_filter.clear();
+                }
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.separator();
@@ -387,7 +390,7 @@ impl eframe::App for MirVisApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(fn_drawer) = self.selected_fn.and_then(|id| self.fn_drawers.get_mut(&id)) {
-                boris_renderer::boris_view(ctx, ui, &fn_drawer.body, &mut fn_drawer.selected_def);
+                boris_renderer::boris_view(ctx, ui, &fn_drawer.body, &mut fn_drawer.selected_defs);
             }
         });
     }

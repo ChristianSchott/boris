@@ -1,6 +1,6 @@
 use either::Either;
 use la_arena::{Arena, ArenaMap, Idx};
-use ra_ap_hir::{Adt, GenericDef};
+use ra_ap_hir::{known::sub, Adt, GenericDef, HasSource};
 use ra_ap_hir_def::{DefWithBodyId, FieldId, HasModule, TupleFieldId};
 use ra_ap_hir_ty::{
     db::HirDatabase,
@@ -14,6 +14,11 @@ use ra_ap_ide::CrateId;
 
 pub type MovePathId = Idx<MovePath>;
 pub type PlaceElem = ProjectionElem<LocalId, Ty>;
+
+pub struct PlaceInfo {
+    pub is_copy: bool,
+    pub behind_mutable_ref: Option<bool>,
+}
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub enum ProjectionKind {
@@ -87,9 +92,14 @@ impl MovePath {
                 .type_parameters(Interner)
                 .any(|param| Self::has_ref(&param.kind(Interner), db)),
             TyKind::Array(ty, _) | TyKind::Slice(ty) => Self::has_ref(ty.kind(Interner), db),
-            TyKind::Adt(adt_id, _) => {
+            TyKind::Adt(adt_id, subst) => {
                 let def = GenericDef::from(Adt::from(adt_id.0));
-                !def.lifetime_params(db).is_empty()
+                if !def.lifetime_params(db).is_empty() {
+                    return true;
+                }
+                subst
+                    .type_parameters(Interner)
+                    .any(|ty| Self::has_ref(ty.kind(Interner), db))
             }
             TyKind::Closure(id, subst) => {
                 let (def, _) = db.lookup_intern_closure((*id).into());
@@ -199,27 +209,31 @@ impl<'a> MoveData<'a> {
         matches!(self[move_path_id].parent, ParentKind::Local(_))
     }
 
-    pub fn place_info(&self, place: &Place) -> (bool, Option<bool>) {
+    pub fn place_info(&self, place: &Place) -> PlaceInfo {
         let mut ty = self.body.locals[place.local].ty.clone();
         let mut behind_mutable_ref = None;
         for proj in place.projection.lookup(&self.body.projection_store) {
             if matches!(proj, PlaceElem::Deref) {
-                match ty.kind(Interner) {
+                let mutable = match ty.kind(Interner) {
                     TyKind::Ref(mutability, _, _) | TyKind::Raw(mutability, _) => {
-                        behind_mutable_ref = Some(matches!(mutability, Mutability::Mut));
+                        matches!(mutability, Mutability::Mut)
                     }
                     // TyKind::Adt(id, _) => ,// check if is lang_item owned box
                     _ => {
                         println!("Deref called on non-ref type. Probably a box.. TODO");
                         // just pretend like it is mutable for now..
-                        behind_mutable_ref = Some(true);
+                        true
                     }
-                }
+                };
+                *behind_mutable_ref.get_or_insert(true) &= mutable;
             }
             ty = self.projected_ty(ty.clone(), proj);
         }
         let is_copy = ty.is_copy(self.db, self.body.owner);
-        (is_copy, behind_mutable_ref)
+        PlaceInfo {
+            is_copy,
+            behind_mutable_ref: behind_mutable_ref,
+        }
     }
 
     fn alloc_place(&mut self, place: &Place) {
@@ -269,7 +283,10 @@ impl<'a> MoveData<'a> {
             .collect();
 
         // for (local, mp) in locals.iter() {
-        //     println!("{local:?}: is copy {}", move_paths[*mp].is_copy);
+        //     println!(
+        //         "{local:?}: is copy {}; ref {:?}",
+        //         move_paths[*mp].is_copy, move_paths[*mp].ref_info
+        //     );
         // }
 
         let mut move_data = MoveData {

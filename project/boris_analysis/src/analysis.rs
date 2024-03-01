@@ -313,10 +313,14 @@ impl Analysis {
         self.host.apply_change(analysis_change);
     }
 
-    pub fn thir_body(&self, fn_def_id: FunctionId) -> Option<boris_shared::ThirBody> {
+    pub fn bir_body(&self, fn_def_id: FunctionId) -> Option<boris_shared::BirBody> {
         let db = self.host.raw_database().snapshot();
         match Cancelled::catch(|| crate::builder::create_thir_body(fn_def_id, db.upcast())) {
-            Ok(body) => Some(body),
+            Ok(Ok(body)) => Some(body),
+            Ok(Err(err)) => {
+                println!("Failed creating BIR body! MirLowerError: {:?}", err);
+                None
+            }
             Err(err) => {
                 println!("Cancelled! {}", err);
                 None

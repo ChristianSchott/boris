@@ -2,13 +2,13 @@ use boris_shared::{BindingId, ConflictKind, Def, DefId, DependencyKind, Expr, Un
 use hir_def::{
     path::{GenericArg, GenericArgs, Path},
     type_ref::{LifetimeRef, TypeBound},
-    DefWithBodyId, FunctionId, HasModule,
+    DefWithBodyId, FunctionId, HasModule, TupleFieldId, TupleId,
 };
 use hir_ty::{
     db::HirDatabase,
     mir::{
-        BasicBlockId, BorrowKind, LocalId, MirBody, Operand, Place, Rvalue, StatementKind,
-        TerminatorKind,
+        BasicBlockId, BorrowKind, LocalId, MirBody, MirLowerError, Operand, Place, Rvalue,
+        StatementKind, TerminatorKind,
     },
     ClosureId, Interner, TyExt, TyKind,
 };
@@ -23,7 +23,7 @@ use tuple::Map;
 
 use crate::{
     builder::{BindingUsageHint, ThirBodyBuilder},
-    move_path::{MoveData, MovePathId, PlaceElem, ProjectionKind},
+    move_path::{MoveData, MovePathId, PlaceElem, PlaceInfo, ProjectionKind},
 };
 
 pub struct MirBodyWalker<'a> {
@@ -212,16 +212,6 @@ impl Graph {
         self.constraints.entry(a).or_default().push(b);
     }
 
-    // fn is_copy(&self, node: NodeId, move_data: &MoveData) -> bool {
-    //     let move_path = self.nodes[node].move_path;
-    //     move_data[move_path].is_copy
-    // }
-
-    // fn has_ref(&self, node: NodeId, move_data: &MoveData) -> bool {
-    //     let move_path = self.nodes[node].move_path;
-    //     move_data[move_path].has_ref
-    // }
-
     pub fn add_conflict(&mut self, conflict: Conflict) {
         self.conflicts.push(conflict);
     }
@@ -236,9 +226,9 @@ impl std::ops::Index<NodeId> for Graph {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct ValueSources(SmallVec<[NodeId; 1]>);
+pub struct NodeIds(SmallVec<[NodeId; 1]>);
 
-impl ValueSources {
+impl NodeIds {
     fn merge(&mut self, other: &Self) {
         for other_source in other.0.iter() {
             if !self.0.contains(other_source) {
@@ -252,13 +242,13 @@ impl ValueSources {
     }
 }
 
-impl From<NodeId> for ValueSources {
+impl From<NodeId> for NodeIds {
     fn from(value: NodeId) -> Self {
         Self(smallvec![value])
     }
 }
 
-impl PartialEq for ValueSources {
+impl PartialEq for NodeIds {
     fn eq(&self, other: &Self) -> bool {
         // contain same elements ignoring order
         self.0.len() == other.0.len() && self.0.iter().all(|x| other.0.contains(x))
@@ -267,8 +257,9 @@ impl PartialEq for ValueSources {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 struct MovePathState {
-    source: ValueSources,
-    moved: Option<ValueSources>,
+    source: NodeIds,
+    moved: Option<NodeIds>,
+    maybe_uninit: bool, // when the move path is initialized in one predecessor, but not the other one
 }
 
 impl MovePathState {
@@ -276,6 +267,7 @@ impl MovePathState {
         MovePathState {
             source: node.into(),
             moved: None,
+            maybe_uninit: false,
         }
     }
 
@@ -286,11 +278,18 @@ impl MovePathState {
             (None, Some(other_moved)) => self.moved = Some(other_moved.clone()),
             _ => (),
         }
+        self.maybe_uninit |= other.maybe_uninit;
+    }
+
+    fn set_maybe_uninit(&mut self) {
+        if !self.source.0.is_empty() {
+            self.maybe_uninit = true;
+        }
     }
 
     fn mark_moved(&mut self, node: NodeId) {
         self.moved
-            .get_or_insert_with(|| ValueSources::default())
+            .get_or_insert_with(|| NodeIds::default())
             .0
             .push(node);
     }
@@ -320,13 +319,18 @@ impl MovePathStates {
     fn merge(&mut self, other: &MovePathStates, move_data: &MoveData) {
         for (id, _) in move_data.move_paths.iter() {
             match (self.0.get_mut(id), other.0.get(id)) {
-                (Some(state), Some(prev_state)) => {
-                    state.merge(prev_state);
+                (Some(state), Some(other_state)) => {
+                    state.merge(other_state);
                 }
-                (None, Some(prev_state)) => {
-                    self.0.insert(id, prev_state.clone());
+                (None, Some(other_state)) => {
+                    let mut new_state = other_state.clone();
+                    new_state.set_maybe_uninit();
+                    self.0.insert(id, new_state);
                 }
-                (_, None) => (),
+                (Some(state), None) => {
+                    state.set_maybe_uninit();
+                }
+                (None, None) => (),
             }
         }
     }
@@ -379,13 +383,14 @@ pub fn walk_thir_body<'a>(
     thir_builder: &'a ThirBodyBuilder<'a>,
     db: &'a dyn HirDatabase,
     owner: FunctionId,
-) -> Graph {
+) -> Result<Graph, MirLowerError> {
     let mut graph = Graph::default();
 
-    let body = db.mir_body(owner.into()).unwrap();
+    //  TODO: prop errors..
+    let body = db.mir_body(owner.into())?; // FIXME: unwrap
     let body_walker = MirBodyWalker::new(thir_builder, &body, db);
     body_walker.walk(&mut graph, None, Some(thir_builder.return_binding()));
-    graph
+    Result::Ok(graph)
 }
 
 impl<'a> MirBodyWalker<'a> {
@@ -498,8 +503,8 @@ impl<'a> MirBodyWalker<'a> {
         graph: &mut Graph,
         captures: Option<&[(MovePathId, NodeId)]>,
         ret_def: Option<BindingId>,
-    ) {
-        let statements = self.graph_statements(graph, captures, ret_def);
+    ) -> Result<(), MirLowerError> {
+        let statements = self.graph_statements(graph, captures, ret_def)?;
 
         let block_sequence = self.basic_block_sequence();
         let block_sequence_inv = self.basic_block_sequence_inv(&block_sequence);
@@ -554,6 +559,7 @@ impl<'a> MirBodyWalker<'a> {
         }
 
         self.dependencies(graph, &on_entry, &statements);
+        Result::Ok(())
     }
 
     const RETURN_LOCAL: LocalId = LocalId::from_raw(RawIdx::from_u32(0));
@@ -564,7 +570,7 @@ impl<'a> MirBodyWalker<'a> {
         graph: &mut Graph,
         captures: Option<&[(MovePathId, NodeId)]>,
         ret_binding: Option<BindingId>,
-    ) -> ArenaMap<LocationId, NodeStatement> {
+    ) -> Result<ArenaMap<LocationId, NodeStatement>, MirLowerError> {
         enum PlaceProjection {
             Deref(NodeId, bool),
             MovePath(MovePathId),
@@ -598,7 +604,10 @@ impl<'a> MirBodyWalker<'a> {
 
             for proj in projections.iter() {
                 if matches!(proj, PlaceElem::Deref) {
-                    let (is_copy, behind_mutable_ref) = self.move_data.place_info(place);
+                    let PlaceInfo {
+                        is_copy,
+                        behind_mutable_ref,
+                    } = self.move_data.place_info(place);
                     let behind_mutable_ref = behind_mutable_ref.expect("This place contains a deref, thus information about the reference should be present.");
                     let deref_node = graph.alloc(
                         match as_lvalue {
@@ -711,7 +720,8 @@ impl<'a> MirBodyWalker<'a> {
                            closure: ClosureId,
                            ops: &[Operand],
                            lvalue_node: NodeId,
-                           usages: &mut Usages| {
+                           usages: &mut Usages|
+         -> Result<(), MirLowerError> {
             let span = self.location_def(loc);
             let capture_nodes = Box::from_iter(ops.iter().filter_map(|op| {
                 Some(match op {
@@ -727,7 +737,7 @@ impl<'a> MirBodyWalker<'a> {
                 graph.connect_lifetimes(*node, lvalue_node);
             }
 
-            let closure_body = self.db.mir_body_for_closure(closure).unwrap();
+            let closure_body = self.db.mir_body_for_closure(closure)?;
             let walker = MirBodyWalker::new(self.thir_builder, &closure_body, self.db);
 
             let (capture_binding, capture_def, ret_binding) = span
@@ -770,7 +780,7 @@ impl<'a> MirBodyWalker<'a> {
             }
             graph.connect_lifetimes(lvalue_node, root_node);
 
-            walker.walk(graph, Some(&capture_assignments), ret_binding);
+            walker.walk(graph, Some(&capture_assignments), ret_binding)
         };
 
         for (block_id, block) in self.mir_body.basic_blocks.iter() {
@@ -815,19 +825,31 @@ impl<'a> MirBodyWalker<'a> {
                                         graph.connect_lifetimes(op_node, lvalue_node);
                                     }
                                 }
-                                hir_ty::mir::AggregateKind::Tuple(_) => {
-                                    for (index, op) in ops.iter().enumerate() {
-                                        if let Some((op_node, lvalue_node)) =
-                                            use_operand(graph, op, loc, index as u32, &mut usages)
+                                hir_ty::mir::AggregateKind::Tuple(ty) => {
+                                    match ty.kind(Interner) {
+                                        TyKind::Tuple(_, _) => {
+                                            for (index, op) in ops.iter().enumerate() {
+                                                if let Some((op_node, lvalue_node)) = use_operand(
+                                                    graph,
+                                                    op,
+                                                    loc,
+                                                    index as u32,
+                                                    &mut usages,
+                                                )
                                                 .zip(graph.find_connected(
                                                     lvalue_node,
-                                                    EdgeKind::Projection(
-                                                        ProjectionKind::ClosureField(index),
-                                                    ),
-                                                ))
-                                        {
-                                            graph.connect_lifetimes(op_node, lvalue_node);
+                                                    EdgeKind::Projection(ProjectionKind::Field(
+                                                        either::Either::Right(TupleFieldId {
+                                                            tuple: TupleId(!0), // this is currently just a dummy and unused by mir lowering
+                                                            index: index as u32,
+                                                        }),
+                                                    )),
+                                                )) {
+                                                    graph.connect_lifetimes(op_node, lvalue_node);
+                                                }
+                                            }
                                         }
+                                        _ => panic!("not a tuple."),
                                     }
                                 }
                                 hir_ty::mir::AggregateKind::Closure(ty) => {
@@ -840,9 +862,9 @@ impl<'a> MirBodyWalker<'a> {
                                                 &ops,
                                                 lvalue_node,
                                                 &mut usages,
-                                            );
+                                            )?;
                                         }
-                                        _ => panic!("not a closure!"),
+                                        _ => panic!("not a closure."),
                                     }
                                 }
                             },
@@ -893,12 +915,14 @@ impl<'a> MirBodyWalker<'a> {
                         );
                     }
                     StatementKind::StorageDead(local) => {
-                        let move_path = self.move_data.move_path_for(*local);
-                        let def = self
-                            .location_def(loc)
-                            .map(|def| self.thir_builder.find_drop_def(def));
-                        let node = graph.alloc(NodeKind::Drop, def);
-                        statements.insert(loc, NodeStatement::EndScope { move_path, node });
+                        if self.binding(*local).is_some() {
+                            let move_path = self.move_data.move_path_for(*local);
+                            let def = self
+                                .location_def(loc)
+                                .map(|def| self.thir_builder.find_drop_def(def));
+                            let node = graph.alloc(NodeKind::Drop, def);
+                            statements.insert(loc, NodeStatement::EndScope { move_path, node });
+                        }
                     }
                     _ => (),
                 }
@@ -937,63 +961,62 @@ impl<'a> MirBodyWalker<'a> {
                                             // but if the closure arguments are empty, args.len() == 0
                                             // assert_eq!(args.len(), fn_data.params.len());
 
-                                            let returns_ref =
-                                                !graph[lvalue_node].lifetimes.is_empty();
-
-                                            if returns_ref {
-                                                let ret_lts = self
-                                                    .find_lifetimes_in_type_ref(&fn_data.ret_type);
-                                                if ret_lts.is_empty() {
-                                                    // lt elision in return type -> return lt must outlive all input lifetimes
-                                                    for (i, arg) in args.iter().enumerate() {
-                                                        if let Some(arg_node) = use_operand(
+                                            if let Some(ret_lts) = (!graph[lvalue_node]
+                                                .lifetimes
+                                                .is_empty())
+                                            .then(|| {
+                                                self.find_lifetimes_in_type_ref(&fn_data.ret_type)
+                                            })
+                                            .and_then(|ret_lts| {
+                                                (!ret_lts.is_empty()).then_some(ret_lts)
+                                            }) {
+                                                let args = Box::from_iter(args
+                                                    .iter()
+                                                    .enumerate()
+                                                    .zip(fn_data.params.iter()).filter_map(|((i, arg), param)| {
+                                                        use_operand(
                                                             graph,
                                                             arg,
                                                             loc,
                                                             i as u32,
                                                             &mut usages,
-                                                        ) {
+                                                        ).map(|node| (node, self.find_lifetimes_in_type_ref(&param)))
+                                                    }));
+
+                                                for ret_lt in ret_lts.iter() {
+                                                    let mut matched = false;
+                                                    for (arg_node, lts) in args.iter() {
+                                                        if lts.contains(ret_lt) {
                                                             graph.connect_lifetimes(
-                                                                arg_node,
+                                                                *arg_node,
                                                                 lvalue_node,
                                                             );
+                                                            matched = true;
                                                         }
                                                     }
-                                                } else {
-                                                    for ((i, arg), param) in args
-                                                        .iter()
-                                                        .enumerate()
-                                                        .zip(fn_data.params.iter())
-                                                    {
-                                                        if let Some(arg_node) = use_operand(
-                                                            graph,
-                                                            arg,
-                                                            loc,
-                                                            i as u32,
-                                                            &mut usages,
-                                                        ) {
-                                                            let param_lts = self
-                                                                .find_lifetimes_in_type_ref(&param);
-                                                            if param_lts.iter().any(|param_lt| {
-                                                                ret_lts.contains(param_lt)
-                                                            }) {
-                                                                graph.connect_lifetimes(
-                                                                    arg_node,
-                                                                    lvalue_node,
-                                                                );
-                                                            }
+                                                    if !matched {
+                                                        for (arg_node, _) in args.iter() {
+                                                            graph.connect_lifetimes(
+                                                                *arg_node,
+                                                                lvalue_node,
+                                                            );
                                                         }
                                                     }
                                                 }
                                             } else {
                                                 for (i, arg) in args.iter().enumerate() {
-                                                    use_operand(
+                                                    if let Some(arg_node) = use_operand(
                                                         graph,
                                                         arg,
                                                         loc,
                                                         i as u32,
                                                         &mut usages,
-                                                    );
+                                                    ) {
+                                                        graph.connect_lifetimes(
+                                                            arg_node,
+                                                            lvalue_node,
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
@@ -1042,6 +1065,14 @@ impl<'a> MirBodyWalker<'a> {
                             used: usages.into(),
                         })
                     }
+                    TerminatorKind::SwitchInt { discr, .. } => {
+                        // this will always just be a copy of a MIR local, so this is not really needed for the analysis..
+                        use_operand(graph, discr, loc, 0, &mut usages);
+                        Some(NodeStatement::Assignment {
+                            assigned: smallvec![],
+                            used: usages.into(),
+                        })
+                    }
                     _ => None,
                 };
                 if let Some(statement) = statement {
@@ -1079,7 +1110,7 @@ impl<'a> MirBodyWalker<'a> {
             );
         }
 
-        statements
+        Result::Ok(statements)
     }
 
     fn dependencies(
@@ -1111,6 +1142,15 @@ impl<'a> MirBodyWalker<'a> {
                                         targets: moved_nodes.iter().collect(),
                                     })
                                 }
+
+                                // FIXME: something about this analysis is wrong currently..
+                                // if state.maybe_uninit {
+                                //     graph.add_conflict(Conflict {
+                                //         kind: ConflictKind::UseOfMaybeUnassigned,
+                                //         from: *usage_node,
+                                //         targets: Default::default(),
+                                //     })
+                                // }
 
                                 if let EdgeKind::Ref(true) = usage_kind {
                                     let targets: Vec<_> = state

@@ -3,7 +3,7 @@ use include_dir::Dir;
 
 // directly include the example files in the compilation, so we don't have to deal with loading them via WASM somehow..
 static EXAMPLES_DIR: Dir<'_> =
-    include_dir::include_dir!("$CARGO_MANIFEST_DIR\\..\\..\\example\\export\\bodies\\");
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/../../example/export/bodies/");
 
 fn example_from_string(file: &str) -> Option<ExampleState> {
     serde_json::from_str(file).ok()

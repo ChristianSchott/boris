@@ -1,14 +1,12 @@
-use std::fmt;
-
 use boris_shared::{
-    ArithOp, Array, BinaryOp, Binding, BindingAnnotation, BindingId, CmpOp, Conflict, DataFlowInfo,
-    DataFlowTree, DataFlowTreeId, Def, DefEdgeKind, DefId, DefNode, DefSet, DependencyKind, Expr,
-    ForLoopResugaring, LogicOp, MacroResugaring, MatchArm, Mutability, Ordering, Pat, PathInfo,
-    QuestionMarkResugaring, Resugaring, Statement, ThirBody, UnaryOp, WhileLoopResugaring,
+    ArithOp, Array, BinaryOp, Binding, BindingAnnotation, BindingId, BirBody, Block, CmpOp,
+    Conflict, Def, DefEdgeKind, DefId, DefNode, DefSet, DefSpan, Expr, ForLoopResugaring, LogicOp,
+    MacroResugaring, Mutability, Ordering, Pat, PathInfo, QuestionMarkResugaring, Resugaring,
+    UnaryOp, WhileLoopResugaring,
 };
 use itertools::Itertools;
-use la_arena::{Arena, ArenaMap, RawIdx};
-use ra_ap_hir::{DefWithBody, HasCrate, HirDisplay, InFile, TypeRef};
+use la_arena::{Arena, ArenaMap};
+use ra_ap_hir::{mir::MirLowerError, HasCrate, HirDisplay, InFile, TypeRef};
 use ra_ap_hir_def::{
     body::{Body, BodySourceMap},
     hir::{self, ExprId, LabelId, PatId},
@@ -25,9 +23,9 @@ use ra_ap_syntax::{
 };
 use smallvec::{smallvec, SmallVec};
 
-use crate::body_walker::{self, walk_thir_body, EdgeKind, Node, NodeId, NodeKind};
+use crate::body_walker::{walk_thir_body, EdgeKind, Node, NodeId, NodeKind};
 
-pub fn create_thir_body<'a>(owner: FunctionId, db: &'a dyn HirDatabase) -> ThirBody {
+pub fn create_thir_body<'a>(owner: FunctionId, db: &'a dyn HirDatabase) -> Result<BirBody, MirLowerError> {
     let (hir_body, hir_source_map) = db.body_with_source_map(owner.into());
     let infer = db.infer(owner.into());
 
@@ -48,9 +46,11 @@ pub(crate) struct ThirBodyBuilder<'a> {
     bindings: Arena<Binding>,
     binding_defs: ArenaMap<BindingId, SmallVec<[DefId; 1]>>,
     bindings_map: ArenaMap<hir::BindingId, BindingId>,
+    binding_scopes: ArenaMap<BindingId, DefId>,
 
     body_def_id: DefId,
     param_def_ids: Vec<DefId>,
+    world_scope_id: DefId,
     ret_def_id: DefId,
     ret_binding_id: BindingId,
 
@@ -122,51 +122,52 @@ impl<'a> ThirBodyBuilder<'a> {
 
             match def {
                 Def::Expr(expr) => match expr {
-                    Expr::Block {
+                    Expr::Block(Block {
                         statements,
                         tail,
                         scope_start,
                         scope_end,
-                    } => {
+                    }) => {
                         set_parent(scope_start);
                         set_parent(scope_end);
-                        statements.iter().for_each(|statement| match statement {
-                            Statement::Let {
-                                initializer, pat, ..
-                            } => {
-                                set_parent(pat);
-                                if let Some(init) = initializer {
-                                    set_parent(init);
-                                }
-                            }
-                            Statement::Expr { expr } => set_parent(expr),
-                        });
+                        for statement in statements.iter() {
+                            set_parent(statement);
+                        }
                         tail.iter().for_each(set_parent);
                     }
-                    Expr::If {
-                        condition,
-                        then_branch,
-                        else_branch,
-                    } => [condition, then_branch]
-                        .into_iter()
-                        .chain(else_branch.iter())
-                        .for_each(set_parent),
-                    Expr::Match { expr, arms } => {
+                    Expr::IfArm {
+                        condition, expr, ..
+                    } => {
+                        set_parent(condition);
                         set_parent(expr);
-                        for arm in arms.iter() {
-                            set_parent(&arm.pat);
-                            if let Some(guard) = &arm.guard {
-                                set_parent(guard);
-                            }
-                            set_parent(&arm.expr);
+                    }
+                    Expr::Branch {
+                        entry_dummy, arms, ..
+                    } => {
+                        set_parent(entry_dummy);
+                        arms.iter().for_each(|arm| set_parent(arm));
+                    }
+                    Expr::Match { expr, branch } => {
+                        set_parent(expr);
+                        set_parent(branch);
+                    }
+                    Expr::MatchArm { pat, guard, expr, entry_dummy } => {
+                        set_parent(entry_dummy);
+                        set_parent(pat);
+                        if let Some(guard) = guard {
+                            set_parent(guard);
                         }
+                        set_parent(expr);
                     }
                     Expr::BinaryOp { lhs, rhs, .. } => [lhs, rhs].into_iter().for_each(set_parent),
                     Expr::Call { callee, args } => {
-                        [callee].into_iter().chain(args).for_each(set_parent);
+                        [callee].into_iter().chain(args.iter()).for_each(set_parent);
                     }
                     Expr::MethodCall { receiver, args, .. } => {
-                        [receiver].into_iter().chain(args).for_each(set_parent);
+                        [receiver]
+                            .into_iter()
+                            .chain(args.iter())
+                            .for_each(set_parent);
                     }
                     Expr::Index { base, index_expr } => {
                         [base, index_expr].into_iter().for_each(set_parent);
@@ -193,13 +194,20 @@ impl<'a> ThirBodyBuilder<'a> {
                             [initializer, repeat].into_iter().for_each(set_parent);
                         }
                     },
-                    Expr::Field { expr, .. }
+                    Expr::ElseArm { expr,lit_dummy }=>[expr, lit_dummy].into_iter().for_each(set_parent),
+                    | Expr::Field { expr, .. }
                     | Expr::Loop { body: expr, .. }
                     | Expr::Ref { expr, .. }
                     | Expr::UnaryOp { expr, .. }
                     | Expr::Box { expr } => set_parent(expr),
-                    Expr::Let { expr, pat } => {
+                    Expr::Let { expr, pat, .. } => {
                         [expr, pat].into_iter().for_each(set_parent);
+                    }
+                    Expr::LetStatement {
+                        pat, initializer, ..
+                    } => {
+                        set_parent(pat);
+                        initializer.iter().for_each(set_parent);
                     }
                     Expr::Closure {
                         body_expr,
@@ -224,7 +232,7 @@ impl<'a> ThirBodyBuilder<'a> {
                     Pat::Bind { subpat, .. } => subpat.iter().for_each(set_parent),
                     Pat::Ref { pat, .. } => set_parent(pat),
                     Pat::Record { args, .. } => {
-                        for (_, pat) in args {
+                        for (_, pat) in args.iter() {
                             set_parent(pat);
                         }
                     }
@@ -239,8 +247,10 @@ impl<'a> ThirBodyBuilder<'a> {
         parent_map
     }
 
-    fn child_def_map(defs: &Arena<Def>) -> ArenaMap<DefId, SmallVec<[DefId; 1]>> {
-        let parent_map = Self::parent_def_map(defs);
+    fn child_def_map(
+        defs: &Arena<Def>,
+        parent_map: &ArenaMap<DefId, DefId>,
+    ) -> ArenaMap<DefId, SmallVec<[DefId; 1]>> {
         let mut child_pats: ArenaMap<DefId, SmallVec<[DefId; 1]>> = defs
             .iter()
             .map(|(id, _)| (id, smallvec::smallvec![]))
@@ -374,6 +384,8 @@ impl<'a> ThirBodyBuilder<'a> {
             }
         };
 
+        let mut binding_scopes: ArenaMap<BindingId, DefId> = ArenaMap::default();
+        let mut pat_scopes = vec![];
         for (hir_expr_id, expr) in body.exprs.iter() {
             let def_id = map_expr(hir_expr_id);
 
@@ -391,53 +403,123 @@ impl<'a> ThirBodyBuilder<'a> {
                 }
                 | hir::Expr::Async {
                     statements, tail, ..
-                } => Expr::Block {
-                    scope_start: noop(&mut defs),
-                    scope_end: noop(&mut defs),
-                    statements: statements
+                } => {
+                    let scope_start = noop(&mut defs);
+                    let statements = statements
                         .iter()
-                        .map(|stmnt| match stmnt {
-                            hir::Statement::Let {
-                                pat,
-                                initializer,
-                                type_ref,
-                                else_branch,
-                            } => Statement::Let {
-                                pat: map_pat(*pat),
-                                type_ref: type_ref.as_ref().map(|ty_ref| {
-                                    ty_ref.as_ref().display_truncated(db, None).to_string()
-                                }),
-                                initializer: initializer.map(map_expr),
-                                else_branch: else_branch.map(map_expr),
-                            },
-                            hir::Statement::Expr { expr, .. } => Statement::Expr {
-                                expr: map_expr(*expr),
-                            },
+                        .scan(scope_start, |last, stmnt| {
+                            let id = match stmnt {
+                                hir::Statement::Let {
+                                    pat,
+                                    initializer,
+                                    type_ref,
+                                    else_branch,
+                                } => {
+                                    let pat = map_pat(*pat);
+                                    pat_scopes.push((pat, def_id));
+                                    let let_expr = defs.alloc(Def::Expr(Expr::LetStatement {
+                                        pat,
+                                        type_ref: type_ref.as_ref().map(|ty_ref| {
+                                            ty_ref.as_ref().display_truncated(db, None).to_string()
+                                        }),
+                                        initializer: initializer.map(map_expr),
+                                    }));
+
+                                    if let Some(else_branch) = else_branch {
+                                        let lit_dummy = noop(&mut defs);
+                                        let else_branch = defs.alloc(Def::Expr(Expr::ElseArm {
+                                            expr: map_expr(*else_branch),lit_dummy,
+                                        }));
+                                        let entry_dummy = noop(&mut defs);
+                                        defs.alloc(Def::Expr(Expr::Branch {
+                                            entry_dummy,
+                                            arms: [let_expr, else_branch].into(),
+                                            full_defer: true,
+                                        }))
+                                    } else {
+                                        let_expr
+                                    }
+                                }
+                                hir::Statement::Expr { expr, .. } => map_expr(*expr),
+                            };
+                            *last = id;
+                            Some(id)
                         })
-                        .collect(),
-                    tail: tail.map(map_expr),
-                },
+                        .collect();
+                    Expr::Block(Block {
+                        scope_start,
+                        scope_end: noop(&mut defs),
+                        statements,
+                        tail: tail.map(map_expr),
+                    })
+                }
                 hir::Expr::Const(const_block_id) => {
                     let const_block = db.lookup_intern_anonymous_const(*const_block_id);
                     assert_eq!(const_block.parent, owner.into());
-                    Expr::Block {
+                    Expr::Block(Block {
                         scope_start: noop(&mut defs),
                         scope_end: noop(&mut defs),
-                        statements: vec![],
+                        statements: Default::default(),
                         tail: Some(map_expr(const_block.root)),
-                    }
+                    })
                 }
-                hir::Expr::Match { expr, arms } => Expr::Match {
-                    expr: map_expr(*expr),
-                    arms: arms
-                        .iter()
-                        .map(|arm| MatchArm {
-                            pat: map_pat(arm.pat),
+                hir::Expr::Match { expr, arms } => {
+                    let arms = Box::from_iter(arms.iter().map(|arm| {
+                        let entry_dummy = noop(&mut defs); 
+                        let pat = map_pat(arm.pat);
+                        let arm = defs.alloc(Def::Expr(Expr::MatchArm {
+                            entry_dummy,
+                            pat,
                             guard: arm.guard.map(map_expr),
                             expr: map_expr(arm.expr),
-                        })
-                        .collect(),
-                },
+                        }));
+                        pat_scopes.push((pat, arm));
+                        arm
+                    }));
+                    let expr = map_expr(*expr);
+                    let entry_dummy = noop(&mut defs);
+                    Expr::Match {
+                        expr,
+                        branch: defs.alloc(Def::Expr(Expr::Branch {
+                            entry_dummy,
+                            arms,
+                            full_defer: true,
+                        })),
+                    }
+                }
+                hir::Expr::If {
+                    condition,
+                    then_branch,
+                    else_branch,
+                } => {
+                    let cond_id = map_expr(*condition);
+                    let if_arm = defs.alloc(Def::Expr(Expr::IfArm {
+                        else_if: false,
+                        condition: cond_id,
+                        expr: map_expr(*then_branch),
+                    }));
+                    if let hir::Expr::Let { pat, .. } = &body.exprs[*condition] {
+                        pat_scopes.push((map_pat(*pat), if_arm));
+                    }
+                    if let Some(else_branch) = else_branch {
+                        let lit_dummy = noop(&mut defs);
+                        let else_arm =defs.alloc(Def::Expr(Expr::ElseArm {
+                            expr: map_expr(*else_branch),
+                            lit_dummy,
+                        }));
+                        Expr::Branch {
+                            entry_dummy: noop(&mut defs),
+                            arms: [if_arm, else_arm].into(),
+                            full_defer: true,
+                        }
+                    } else {
+                        Expr::Branch {
+                            entry_dummy: noop(&mut defs),
+                            arms: [if_arm].into(),
+                            full_defer: false,
+                        }
+                    }
+                }
                 hir::Expr::Ref {
                     expr, mutability, ..
                 } => Expr::Ref {
@@ -457,7 +539,7 @@ impl<'a> ThirBodyBuilder<'a> {
                 },
                 hir::Expr::Call { callee, args, .. } => Expr::Call {
                     callee: map_expr(*callee),
-                    args: args.iter().map(|e| map_expr(*e)).collect_vec(),
+                    args: Box::from_iter(args.iter().map(|e| map_expr(*e))),
                 },
                 hir::Expr::MethodCall {
                     receiver,
@@ -467,7 +549,7 @@ impl<'a> ThirBodyBuilder<'a> {
                 } => Expr::MethodCall {
                     receiver: map_expr(*receiver),
                     fn_name: method_name.display(db.upcast()).to_string(),
-                    args: args.iter().map(|e| map_expr(*e)).collect_vec(),
+                    args: Box::from_iter(args.iter().map(|e| map_expr(*e))),
                 },
                 hir::Expr::Literal(lt) => Expr::Literal(match lt {
                     hir::Literal::String(string) => {
@@ -485,15 +567,6 @@ impl<'a> ThirBodyBuilder<'a> {
                 hir::Expr::Field { expr, name } => Expr::Field {
                     expr: map_expr(*expr),
                     field: name.display(db.upcast()).to_string(),
-                },
-                hir::Expr::If {
-                    condition,
-                    then_branch,
-                    else_branch,
-                } => Expr::If {
-                    condition: map_expr(*condition),
-                    then_branch: map_expr(*then_branch),
-                    else_branch: else_branch.map(map_expr),
                 },
                 hir::Expr::Loop { body, label } => Expr::Loop {
                     body: map_expr(*body),
@@ -523,15 +596,12 @@ impl<'a> ThirBodyBuilder<'a> {
                         .as_deref()
                         .map(|path| path_to_string(path))
                         .unwrap_or_default(),
-                    fields: fields
-                        .iter()
-                        .map(|field| {
-                            (
-                                field.name.display(db.upcast()).to_string(),
-                                map_expr(field.expr),
-                            )
-                        })
-                        .collect_vec(),
+                    fields: Box::from_iter(fields.iter().map(|field| {
+                        (
+                            field.name.display(db.upcast()).to_string(),
+                            map_expr(field.expr),
+                        )
+                    })),
                     spread: spread.map(map_expr),
                     ellipsis: *ellipsis,
                 },
@@ -539,7 +609,7 @@ impl<'a> ThirBodyBuilder<'a> {
                     expr: expr.map(map_expr),
                 },
                 hir::Expr::Tuple { exprs, .. } => Expr::Tuple {
-                    exprs: exprs.iter().map(|e| map_expr(*e)).collect_vec(),
+                    exprs: Box::from_iter(exprs.iter().map(|e| map_expr(*e))),
                 },
                 hir::Expr::Closure {
                     args,
@@ -550,16 +620,26 @@ impl<'a> ThirBodyBuilder<'a> {
                     let ret_def_id = noop(&mut defs);
                     let ret_binding_id = bindings.alloc(Binding::Fake);
                     binding_defs.insert(ret_binding_id, smallvec![ret_def_id]);
+                    binding_scopes.insert(ret_binding_id, ret_def_id);
+
+                    let capture_def_id = noop(&mut defs);
+                    let capture_binding_id = bindings.alloc(Binding::Fake);
+                    binding_defs.insert(capture_binding_id, smallvec![capture_def_id]);
+                    binding_scopes.insert(capture_binding_id, capture_def_id);
 
                     Expr::Closure {
-                        capture_binding: bindings.alloc(Binding::Fake),
-                        capture_dummy: noop(&mut defs),
+                        capture_binding: capture_binding_id,
+                        capture_dummy: capture_def_id,
                         args: if args.is_empty() {
                             // FIXME: with the new `capture_dummy` this is probably not needed anymore
                             // empty args cause problems during lt-span generation, so we insert a dummy def_id here..
-                            vec![noop(&mut defs)]
+                            Box::new([noop(&mut defs)])
                         } else {
-                            args.iter().map(|arg| map_pat(*arg)).collect_vec()
+                            Box::from_iter(args.iter().map(|arg| {
+                                let pat = map_pat(*arg);
+                                pat_scopes.push((pat, capture_def_id));
+                                pat
+                            }))
                         },
                         body_expr: map_expr(*body),
                         capture_by: match capture_by {
@@ -572,7 +652,7 @@ impl<'a> ThirBodyBuilder<'a> {
                 }
                 hir::Expr::Array(vals) => Expr::Array(match vals {
                     hir::Array::ElementList { elements, .. } => Array::ElementList {
-                        elements: elements.iter().map(|e| map_expr(*e)).collect_vec(),
+                        elements: Box::from_iter(elements.iter().map(|e| map_expr(*e))),
                     },
                     hir::Array::Repeat {
                         initializer,
@@ -616,7 +696,7 @@ impl<'a> ThirBodyBuilder<'a> {
                     mutability: convert_mutability(mutability),
                 },
                 hir::Pat::Or(pats) => Pat::Or {
-                    patterns: pats.iter().map(|pat| map_pat(*pat)).collect_vec(),
+                    patterns: pats.iter().map(|pat| map_pat(*pat)).collect(),
                 },
                 hir::Pat::Path(path) => Pat::Path(path_to_string(&path)),
                 hir::Pat::Tuple { args, ellipsis } => Pat::Tuple {
@@ -640,7 +720,7 @@ impl<'a> ThirBodyBuilder<'a> {
                                 map_pat(field.pat),
                             )
                         })
-                        .collect_vec(),
+                        .collect(),
                     ellipsis: *ellipsis,
                 },
                 hir::Pat::TupleStruct {
@@ -652,9 +732,11 @@ impl<'a> ThirBodyBuilder<'a> {
                         .as_deref()
                         .map(|path| path_to_string(path))
                         .unwrap_or_default(),
-                    args: args.iter().map(|field| map_pat(*field)).collect_vec(),
+                    args: args.iter().map(|field| map_pat(*field)).collect(),
                     ellipsis: *ellipsis,
                 },
+                hir::Pat::ConstBlock(block) => Pat::Lit(map_expr(*block)), // TODO: not quite correct
+                // TODO: Range & Slice pats..
                 _ => {
                     println!("Unhandled pattern {:?}", pat);
                     Pat::Unimplemented
@@ -662,6 +744,7 @@ impl<'a> ThirBodyBuilder<'a> {
             });
         }
 
+        let world_scope_id = noop(&mut defs);
         let ret_def_id = noop(&mut defs);
         let ret_binding_id = bindings.alloc(Binding::Fake);
         binding_defs.insert(ret_binding_id, smallvec![ret_def_id]);
@@ -669,9 +752,33 @@ impl<'a> ThirBodyBuilder<'a> {
         let body_def_id = map_expr(body.body_expr);
         let param_def_ids = body.params.iter().cloned().map(map_pat).collect_vec();
         let parent_def_map = Self::parent_def_map(&defs);
-        let child_def_map = Self::child_def_map(&defs);
+        let child_def_map = Self::child_def_map(&defs, &parent_def_map);
+
+        // move this somewhere better..
+        for (pat, owner) in pat_scopes {
+            let mut stack = vec![pat];
+            while let Some(top) = stack.pop() {
+                if let Def::Pat(Pat::Bind { binding_id, .. }) = &defs[top] {
+                    if let Some(scope) = binding_scopes.get(*binding_id) {
+                        assert_eq!(*scope, owner, "Same binding owned by different scopes.");
+                    } else {
+                        binding_scopes.insert(*binding_id, owner);
+                    }
+                }
+                if let Some(children) = child_def_map.get(top) {
+                    stack.extend(children.iter());
+                }
+            }
+        }
+
         let next_def_map = Self::next_control_flow_def_map(&defs);
-        let def_sequence = Self::def_sequence(&defs, &param_def_ids, body_def_id, ret_def_id);
+        let def_sequence = Self::def_sequence(
+            &defs,
+            world_scope_id,
+            &param_def_ids,
+            body_def_id,
+            ret_def_id,
+        );
         let def_sequence_inv = Self::invert_sequence(&defs, &def_sequence);
         Self {
             owner,
@@ -682,6 +789,7 @@ impl<'a> ThirBodyBuilder<'a> {
             defs,
             body_def_id,
             param_def_ids,
+            world_scope_id,
             ret_def_id,
             ret_binding_id,
             parent_def_map,
@@ -692,29 +800,30 @@ impl<'a> ThirBodyBuilder<'a> {
             bindings,
             bindings_map,
             binding_defs,
+            binding_scopes,
             def_sequence,
             def_sequence_inv,
         }
     }
 
-    fn body(self) -> ThirBody {
+    fn body(self) -> Result<BirBody, MirLowerError> {
         let data = self.db.function_data(self.owner);
         let name = data.name.display(self.db.upcast()).to_string();
         let ty_to_string = |type_ref: &TypeRef| -> String {
             type_ref.display_truncated(self.db, None).to_string()
         };
-        let params = self
-            .param_def_ids
-            .iter()
-            .zip(data.params.iter())
-            .map(|(id, ty_ref)| (*id, ty_to_string(&ty_ref)))
-            .collect_vec();
+        let params = Box::from_iter(
+            self.param_def_ids
+                .iter()
+                .zip(data.params.iter())
+                .map(|(id, ty_ref)| (*id, ty_to_string(&ty_ref))),
+        );
         let return_type = ty_to_string(&data.ret_type);
         let body_expr = self.map_expr(self.body.body_expr);
         let never_defs = self.never_defs();
         let def_order = self.def_ordering();
 
-        let (def_graph, def_graph_inv, conflicts) = self.analyze_data_flow(&never_defs);
+        let (def_graph, def_graph_inv, conflicts) = self.analyze_data_flow(&never_defs)?;
 
         let mut selectable_defs = DefSet::new(&self.defs);
         for (def, _) in def_graph.iter() {
@@ -727,9 +836,10 @@ impl<'a> ThirBodyBuilder<'a> {
             selectable_defs.set(id, true);
         }
 
-        ThirBody {
+        Result::Ok(BirBody {
             name,
             params,
+            world_scope: self.world_scope_id,
             return_type: (self.ret_def_id, return_type),
             body_expr,
             defs: self.defs,
@@ -744,7 +854,7 @@ impl<'a> ThirBodyBuilder<'a> {
             def_graph,
             def_graph_inv,
             conflicts,
-        }
+        })
     }
 
     fn never_defs(&self) -> DefSet {
@@ -762,39 +872,43 @@ impl<'a> ThirBodyBuilder<'a> {
                 )
                 .collect_vec();
 
-        // extend until reaching some cf_branch..
-        while let Some(top) = stack.pop() {
-            if never_defs[top] {
-                continue;
-            }
+        for top in stack {
             never_defs.set(top, true);
-
-            if let Some(next) = self.def_sequence.get(top) {
-                stack.extend(
-                    next.iter()
-                        .filter(|&id| {
-                            match &self.defs[*id] {
-                                Def::Expr(Expr::If {
-                                    then_branch,
-                                    else_branch,
-                                    ..
-                                }) => {
-                                    // when if and else branch are never, then continue
-                                    never_defs[*then_branch]
-                                        && else_branch.map(|id| never_defs[id]).unwrap_or(false)
-                                }
-                                Def::Expr(Expr::Match { arms, .. }) => {
-                                    // when all arms are never, then continue..
-                                    arms.iter().all(|arm| never_defs[arm.expr])
-                                }
-                                Def::Expr(Expr::Loop { .. }) => false, // FIXME: always stop at loop?
-                                _ => true,
-                            }
-                        })
-                        .copied(),
-                );
-            }
         }
+
+        // extend until reaching some cf_branch..
+        // while let Some(top) = stack.pop() {
+        //     if never_defs[top] {
+        //         continue;
+        //     }
+        //     never_defs.set(top, true);
+
+        //     if let Some(next) = self.def_sequence.get(top) {
+        //         stack.extend(
+        //             next.iter()
+        //                 .filter(|&id| {
+        //                     match &self.defs[*id] {
+        //                         Def::Expr(Expr::If {
+        //                             then_branch,
+        //                             else_branch,
+        //                             ..
+        //                         }) => {
+        //                             // when if and else branch are never, then continue
+        //                             never_defs[*then_branch]
+        //                                 && else_branch.map(|id| never_defs[id]).unwrap_or(false)
+        //                         }
+        //                         Def::Expr(Expr::Match { arms, .. }) => {
+        //                             // when all arms are never, then continue..
+        //                             arms.iter().all(|arm| never_defs[*arm])
+        //                         }
+        //                         Def::Expr(Expr::Loop { .. }) => false, // FIXME: always stop at loop?
+        //                         _ => true,
+        //                     }
+        //                 })
+        //                 .copied(),
+        //         );
+        //     }
+        // }
         never_defs
     }
 
@@ -853,12 +967,14 @@ impl<'a> ThirBodyBuilder<'a> {
                                             ))
                                         }),
                                     ) {
+                                        let body = self.map_expr(body);
                                         expr_resugar_map.insert(
                                             self.map_expr(id),
                                             Resugaring::ForLoop(ForLoopResugaring {
                                                 pat: self.map_pat(pat),
                                                 iterable: self.map_expr(it),
-                                                body: self.map_expr(body),
+                                                body,
+                                                scope:self.parent_def_map[body],
                                             }),
                                         );
                                     }
@@ -876,11 +992,13 @@ impl<'a> ThirBodyBuilder<'a> {
                         ..
                     } = self.body.exprs[*body]
                     {
+                        let body = self.map_expr(then_branch);
                         expr_resugar_map.insert(
                             self.map_expr(id),
                             Resugaring::WhileLoop(WhileLoopResugaring {
                                 condition: self.map_expr(condition),
-                                body: self.map_expr(then_branch),
+                                body,
+                                scope:self.parent_def_map[body],
                             }),
                         );
                     }
@@ -925,7 +1043,7 @@ impl<'a> ThirBodyBuilder<'a> {
     pub fn next_control_flow_def_map(defs: &Arena<Def>) -> ArenaMap<DefId, DefId> {
         let first_child_def = |id: DefId| match &defs[id] {
             Def::Expr(expr) => match expr {
-                Expr::Block { scope_start,.. } => Some(*scope_start),
+                Expr::Block(Block { scope_start,.. }) => Some(*scope_start),
                 Expr::Range { lhs, rhs, .. } => lhs.or(*rhs),
                 Expr::RecordLit { fields, spread, .. } => {
                     fields.first().map(|(_, def)| *def).or(*spread)
@@ -943,6 +1061,8 @@ impl<'a> ThirBodyBuilder<'a> {
                         *lhs
                     })
                 }
+                Expr::Branch { entry_dummy, .. } => Some(*entry_dummy), 
+                |Expr::LetStatement {  initializer, pat,.. }=>Some(initializer.unwrap_or(*pat)),
                 Expr::Field { expr, .. }
                 | Expr::Loop { body: expr, .. }
                 | Expr::Ref { expr, .. }
@@ -950,9 +1070,10 @@ impl<'a> ThirBodyBuilder<'a> {
                 | Expr::Let { expr, .. }
                 | Expr::Box { expr }
                 | Expr::Match { expr, .. }
-                | Expr::If {
+                | Expr::MatchArm { entry_dummy:expr, ..}
+                | Expr::IfArm {
                     condition: expr, ..
-                }
+                }| Expr::ElseArm { lit_dummy:expr,.. }
                 | Expr::Call { callee: expr, .. }
                 | Expr::MethodCall { receiver: expr, .. }
                 | Expr::Index {
@@ -972,7 +1093,7 @@ impl<'a> ThirBodyBuilder<'a> {
                 Pat::Or { patterns: pats }
                 | Pat::Tuple { pats, .. }
                 | Pat::TupleStruct { args: pats, .. } => pats.first().cloned(),
-                _ => None,
+                Pat::Wild | Pat::Path(_) | Pat::Lit(_) | Pat::Unimplemented => None,
             },
             Def::Noop => None,
         };
@@ -1016,61 +1137,54 @@ impl<'a> ThirBodyBuilder<'a> {
 
             match &defs[def_id] {
                 Def::Expr(expr) => match expr {
-                    Expr::Block {
+                    Expr::Block(Block {
                         statements,
                         tail,
                         scope_start,
                         scope_end,
-                    } => {
+                    }) => {
                         call(*scope_start);
                         for statement in statements.iter() {
-                            match statement {
-                                Statement::Let {
-                                    pat,
-                                    initializer,
-                                    else_branch,
-                                    ..
-                                } => {
-                                    if let Some(initializer) = initializer {
-                                        call(*initializer);
-                                    }
-                                    if let Some(else_branch) = else_branch {
-                                        call(*else_branch);
-                                    }
-                                    call(*pat);
-                                }
-                                Statement::Expr { expr } => call(*expr),
-                            }
+                            call(*statement);
                         }
                         if let Some(tail) = tail {
                             call(*tail);
                         }
                         call(*scope_end);
                     }
-                    Expr::If {
-                        condition,
-                        then_branch,
-                        else_branch,
+                    Expr::IfArm {
+                        condition, expr, ..
                     } => {
                         call(*condition);
-                        call(*then_branch);
-                        if let Some(else_branch) = else_branch {
-                            call(*else_branch);
-                        }
+                        call(*expr);
                     }
-                    Expr::Let { pat, expr } => {
+                    Expr::ElseArm { expr,lit_dummy } => {
+                        call(*lit_dummy);
+                        call(*expr);
+                    },
+                    Expr::Let { pat, expr, .. } => {
                         call(*expr);
                         call(*pat);
                     }
-                    Expr::Match { expr, arms } => {
-                        call(*expr);
-                        for arm in arms.iter() {
-                            call(arm.pat);
-                            if let Some(guard) = arm.guard {
-                                call(guard);
-                            }
-                            call(arm.expr);
+                    Expr::LetStatement {
+                        pat, initializer, ..
+                    } => {
+                        call(*pat);
+                        if let Some(init) = initializer {
+                            call(*init);
                         }
+                    }
+                    Expr::Match { expr, branch } => {
+                        call(*expr);
+                        call(*branch);
+                    }
+                    Expr::MatchArm { pat, guard, expr, entry_dummy } => {
+                        call(*entry_dummy);
+                        call(*pat);
+                        if let Some(guard) = guard {
+                            call(*guard);
+                        }
+                        call(*expr);
                     }
                     Expr::BinaryOp { lhs, rhs, op } => {
                         if matches!(op, BinaryOp::Assignment { .. }) {
@@ -1155,7 +1269,15 @@ impl<'a> ThirBodyBuilder<'a> {
                             call(*expr);
                         }
                     }
-                    _ => (),
+                    Expr::Branch { entry_dummy, arms, .. } => { 
+                        call(*entry_dummy);
+                        arms.iter().cloned().for_each(call);
+                    },
+                    Expr::Path(_)
+                    | Expr::Literal(_)
+                    | Expr::Continue { .. }
+                    | Expr::Missing
+                    | Expr::Unimplemented => (),
                 },
                 Def::Pat(pat) => match pat {
                     Pat::Lit(lit) => call(*lit),
@@ -1185,9 +1307,8 @@ impl<'a> ThirBodyBuilder<'a> {
             counter + 1
         }
 
-        self.param_def_ids
-            .iter()
-            .cloned()
+        std::iter::once(self.world_scope_id)
+            .chain(self.param_def_ids.iter().cloned())
             .chain(std::iter::once(self.body_def_id))
             .chain(std::iter::once(self.ret_def_id))
             .fold(0, |counter, def_id| {
@@ -1203,6 +1324,7 @@ impl<'a> ThirBodyBuilder<'a> {
 
     fn def_sequence(
         defs: &Arena<Def>,
+        world_scope: DefId,
         params: &[DefId],
         body: DefId,
         ret: DefId,
@@ -1235,7 +1357,7 @@ impl<'a> ThirBodyBuilder<'a> {
         let mut stack: Vec<(Option<DefId>, DefId)> = vec![];
 
         connect(body, ret);
-        push_params_and_body(&mut stack, params, body, None);
+        push_params_and_body(&mut stack, params, body, Some(world_scope));
 
         while let Some((last_expr, next_child)) = stack.pop() {
             let mut set_sequence = |children: &[DefId]| {
@@ -1255,55 +1377,47 @@ impl<'a> ThirBodyBuilder<'a> {
             };
             match &defs[next_child] {
                 Def::Expr(expr) => match expr {
-                    Expr::Block {
+                    Expr::Block(Block {
                         statements,
                         tail,
                         scope_start,
                         scope_end,
-                    } => {
+                    }) => {
                         let mut defs = vec![*scope_start];
-                        for s in statements.iter() {
-                            match s {
-                                Statement::Let {
-                                    pat, initializer, ..
-                                } => {
-                                    defs.extend(initializer.iter().cloned());
-                                    defs.push(*pat);
-                                }
-                                Statement::Expr { expr } => defs.push(*expr),
-                            }
-                        }
+                        defs.extend(statements.iter());
                         defs.extend(tail.iter().cloned());
                         defs.push(*scope_end);
                         set_sequence(&defs);
                     }
-                    Expr::If {
-                        condition,
-                        then_branch,
-                        else_branch,
+                    Expr::Branch {
+                        entry_dummy,
+                        arms, full_defer, ..
                     } => {
-                        stack.extend([(last_expr, *condition), (Some(*condition), *then_branch)]);
-                        if let Some(else_branch) = else_branch {
-                            stack.push((Some(*condition), *else_branch));
-                            connect(*else_branch, next_child);
-                        } else {
-                            connect(*condition, next_child);
+                        stack.push((last_expr, *entry_dummy));
+                        for arm in arms.iter() {
+                            stack.push((Some(*entry_dummy), *arm));
+                            connect(*arm, next_child);
                         }
-                        connect(*then_branch, next_child);
-                    }
-                    Expr::Match { expr, arms } => {
-                        stack.push((last_expr, *expr));
-                        for arm in arms {
-                            if let Some(guard_expr) = arm.guard {
-                                stack.extend([
-                                    (Some(*expr), arm.pat),
-                                    (Some(arm.pat), guard_expr),
-                                    (Some(guard_expr), arm.expr),
-                                ]);
-                            } else {
-                                stack.extend([(Some(*expr), arm.pat), (Some(arm.pat), arm.expr)])
+                        if !*full_defer {
+                            // add a skip connection
+                            if let Some(last_expr) = last_expr {
+                                connect(last_expr, next_child);
                             }
-                            connect(arm.expr, next_child);
+                        }
+                    }
+                    Expr::IfArm {
+                        condition, expr, ..
+                    } => {
+                        set_sequence(&[*condition, *expr]);
+                    }
+                    Expr::Match { expr, branch } => {
+                        set_sequence(&[*expr, *branch]);
+                    }
+                    Expr::MatchArm { entry_dummy, pat, guard, expr } => {
+                        if let Some(guard_expr) = guard {
+                            set_sequence(&[*entry_dummy, *pat, *guard_expr, *expr]);
+                        } else {
+                            set_sequence(&[*entry_dummy, *pat, *expr]);
                         }
                     }
                     Expr::BinaryOp { lhs, rhs, op } => {
@@ -1334,9 +1448,7 @@ impl<'a> ThirBodyBuilder<'a> {
                             .chain(spread.clone().into_iter())
                             .collect_vec(),
                     ),
-                    Expr::Break { expr, .. } | Expr::Return { expr } => {
-                        set_sequence(&expr.clone().into_iter().collect_vec());
-                    }
+                   
                     Expr::Tuple { exprs } => set_sequence(&exprs),
                     Expr::Array(arr) => match arr {
                         Array::ElementList { elements } => set_sequence(&elements),
@@ -1346,8 +1458,27 @@ impl<'a> ThirBodyBuilder<'a> {
                         } => set_sequence(&[*initializer, *repeat]),
                     },
                     Expr::Let { pat, expr } => set_sequence(&[*expr, *pat]),
-                    Expr::Field { expr, .. }
-                    | Expr::Loop { body: expr, .. }
+                    Expr::LetStatement {
+                        pat, initializer, ..
+                    } => {
+                        if let Some(init) = initializer {
+                            set_sequence(&[*init, *pat]);
+                        } else {
+                            set_sequence(&[*pat]);
+                        }
+                    }
+                    Expr::Loop { body, .. }=>{
+                        // TODO: create a looping connection to the beginning?
+                        set_sequence(&[*body]);
+                    }
+                    Expr::Break { expr, .. } | Expr::Return { expr } => {
+                        // TODO: connect to wherever the break points to?
+                        set_sequence(&expr.clone().into_iter().collect_vec());
+                    }
+                    Expr::ElseArm { expr ,lit_dummy}=>{
+                        set_sequence(&[*lit_dummy,*expr]);
+                    },
+                    | Expr::Field { expr, .. }
                     | Expr::Ref { expr, .. }
                     | Expr::UnaryOp { expr, .. }
                     | Expr::Box { expr } => set_sequence(&[*expr]),
@@ -1425,9 +1556,9 @@ impl<'a> ThirBodyBuilder<'a> {
                                 Expr::BinaryOp { lhs, rhs, .. } => {
                                     vec![*lhs, *rhs]
                                 }
-                                Expr::Call { args, .. } => args.clone(),
+                                Expr::Call { args, .. } => args.iter().cloned().collect(),
                                 Expr::MethodCall { receiver, args, .. } => {
-                                    let mut args = args.clone();
+                                    let mut args: Vec<_> = args.iter().cloned().collect();
                                     args.insert(0, *receiver);
                                     args
                                 }
@@ -1439,9 +1570,11 @@ impl<'a> ThirBodyBuilder<'a> {
                                     .map(|(_, id)| *id)
                                     .chain(spread.iter().cloned())
                                     .collect(),
-                                Expr::Tuple { exprs } => exprs.clone(),
+                                Expr::Tuple { exprs } => exprs.iter().cloned().collect(),
                                 Expr::Array(arr) => match arr {
-                                    Array::ElementList { elements } => elements.clone(),
+                                    Array::ElementList { elements } => {
+                                        elements.iter().cloned().collect()
+                                    }
                                     Array::Repeat {
                                         initializer,
                                         repeat,
@@ -1470,27 +1603,28 @@ impl<'a> ThirBodyBuilder<'a> {
                     // usage must originate from right side of a let expression/ statement
                     // -> move up to next expr
                     let mut id = Some(top);
-                    let mut last_id = top;
                     while let Some(Def::Pat(_)) = id.map(|id| &self.defs[id]) {
-                        last_id = id.unwrap();
                         id = id.and_then(|id| self.parent_def_map.get(id).copied());
                     }
                     if let Some(id) = id {
                         match &self.defs[id] {
                             Def::Expr(Expr::Let { expr, .. })
                             | Def::Expr(Expr::Match { expr, .. }) => stack.push(*expr),
-                            Def::Expr(Expr::Block { statements, .. }) => {
-                                // if pat is part of a let-statement in a block, the pattern match points the usage to the pattern
-                                if let Some(rhs) = statements.iter().find_map(|s| match s {
-                                    Statement::Let {
-                                        pat,
-                                        initializer: Some(expr),
-                                        ..
-                                    } if *pat == last_id => Some(*expr),
-                                    _ => None,
-                                }) {
-                                    stack.push(rhs);
+                            Def::Expr(Expr::MatchArm { .. }) => {
+                                // go up two levels: MatchArm -> Branch -> Match
+                                if let Some(Def::Expr(Expr::Match { expr, .. })) = self
+                                    .parent_def(id)
+                                    .and_then(|id| self.parent_def(id))
+                                    .map(|parent| &self.defs[parent])
+                                {
+                                    stack.push(*expr);
                                 }
+                            }
+                            Def::Expr(Expr::LetStatement {
+                                initializer: Some(init),
+                                ..
+                            }) => {
+                                stack.push(*init);
                             }
                             _ => (),
                         }
@@ -1543,9 +1677,10 @@ impl<'a> ThirBodyBuilder<'a> {
     }
 
     pub fn find_drop_def(&self, def_id: DefId) -> DefId {
+        // println!("drop def {:?}", self.defs[def_id]);
         match &self[def_id] {
-            Def::Expr(Expr::Block { scope_end, .. }) => *scope_end,
-            Def::Expr(Expr::Closure { body_expr, .. }) => *body_expr, // not sure if this is needed..
+            Def::Expr(Expr::Block(Block { scope_end, .. })) => *scope_end,
+            Def::Expr(Expr::Closure { return_dummy, .. }) => *return_dummy, // not sure if this is needed..
             _ => def_id,
         }
     }
@@ -1553,17 +1688,17 @@ impl<'a> ThirBodyBuilder<'a> {
     fn analyze_data_flow(
         &self,
         never_def_set: &DefSet,
-    ) -> (
+    ) -> Result<(
         ArenaMap<DefId, DefNode>,
         ArenaMap<DefId, SmallVec<[DefId; 1]>>,
         ArenaMap<DefId, Vec<Conflict>>,
-    ) {
+    ), MirLowerError> {
         let following_defs =
             |def_id: DefId, sequence: &ArenaMap<DefId, SmallVec<[DefId; 1]>>| -> DefSet {
                 let mut following = DefSet::new(&self.defs);
                 let mut stack = vec![def_id];
                 while let Some(top) = stack.pop() {
-                    if never_def_set[top] {
+                    if never_def_set[top] || following[top] {
                         continue;
                     }
                     following.set(top, true);
@@ -1574,7 +1709,7 @@ impl<'a> ThirBodyBuilder<'a> {
                 following
             };
 
-        let graph = walk_thir_body(self, self.db, self.owner);
+        let graph = walk_thir_body(self, self.db, self.owner)?;
 
         let track_ref = |node: NodeId| {
             let mut defs = vec![];
@@ -1678,6 +1813,7 @@ impl<'a> ThirBodyBuilder<'a> {
                                     mutable: self.marked_mut(*binding),
                                     binding: *binding,
                                     contains_lt: !node.lifetimes.is_empty(),
+                                    scope: self.binding_scopes.get(*binding).copied(),
                                 },
                                 edges,
                                 active: defs_after_init,
@@ -1719,7 +1855,7 @@ impl<'a> ThirBodyBuilder<'a> {
             }
         }
 
-        (def_graph, def_graph_inv, conflicts)
+        Result::Ok((def_graph, def_graph_inv, conflicts))
     }
 }
 

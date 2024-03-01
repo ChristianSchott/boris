@@ -1,9 +1,10 @@
-use boris_shared::{DefId, ExampleState, ThirBody};
+use boris_shared::{BirBody, DefId, ExampleState};
+use itertools::Itertools;
 
 #[derive(Default)]
 pub struct TemplateApp {
-    body: Option<ThirBody>,
-    selected_def: Option<DefId>,
+    body: Option<BirBody>,
+    selected_defs: Vec<DefId>,
 }
 
 impl TemplateApp {
@@ -11,7 +12,7 @@ impl TemplateApp {
         if let Some(state) = state {
             TemplateApp {
                 body: Some(state.body),
-                selected_def: state.selected,
+                selected_defs: state.selected.into_iter().collect(),
                 ..Default::default()
             }
         } else {
@@ -24,7 +25,7 @@ impl eframe::App for TemplateApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(body) = self.body.as_ref() {
-                boris_renderer::boris_view(ctx, ui, body, &mut self.selected_def);
+                boris_renderer::boris_view(ctx, ui, body, &mut self.selected_defs);
             }
         });
     }
