@@ -1,6 +1,7 @@
+
 use boris_shared::{
     ArithOp, Array, BinaryOp, Binding, BindingAnnotation, BindingId, BirBody, Block, CmpOp,
-    Conflict, Def, DefEdgeKind, DefId, DefNode, DefSet, DefSpan, Expr, ForLoopResugaring, LogicOp,
+    Conflict, Def, DefEdgeKind, DefId, DefNode, DefSet, Expr, ForLoopResugaring, LogicOp,
     MacroResugaring, Mutability, Ordering, Pat, PathInfo, QuestionMarkResugaring, Resugaring,
     UnaryOp, WhileLoopResugaring,
 };
@@ -9,7 +10,7 @@ use la_arena::{Arena, ArenaMap};
 use ra_ap_hir::{mir::MirLowerError, HasCrate, HirDisplay, InFile, TypeRef};
 use ra_ap_hir_def::{
     body::{Body, BodySourceMap},
-    hir::{self, ExprId, LabelId, PatId},
+    hir::{self, ExprId, LabelId, Literal, LiteralOrConst, PatId},
     lang_item::{self, LangItemTarget},
     path::Path,
     resolver::{resolver_for_expr, ValueNs},
@@ -49,6 +50,7 @@ pub(crate) struct ThirBodyBuilder<'a> {
     binding_scopes: ArenaMap<BindingId, DefId>,
 
     body_def_id: DefId,
+    self_def_id: Option<DefId>,
     param_def_ids: Vec<DefId>,
     world_scope_id: DefId,
     ret_def_id: DefId,
@@ -82,11 +84,12 @@ impl<'a> ThirBodyBuilder<'a> {
     }
 
     pub fn map_to_def(&self, span: MirSpan) -> Option<DefId> {
-        Some(match span {
-            MirSpan::ExprId(expr) => self.map_expr(expr),
-            MirSpan::PatId(pat) => self.map_pat(pat),
-            MirSpan::Unknown => return None,
-        })
+        match span {
+            MirSpan::ExprId(expr) => Some(self.map_expr(expr)),
+            MirSpan::PatId(pat) => Some(self.map_pat(pat)),
+            MirSpan::SelfParam =>  self.self_def_id,  
+            MirSpan::Unknown => None,
+        }
     }
 
     pub fn binding_def(&self, binding_id: BindingId) -> Option<DefId> {
@@ -317,7 +320,8 @@ impl<'a> ThirBodyBuilder<'a> {
         let map_pat = |hir_pat_id: hir::PatId| pat_map.get(hir_pat_id).copied().unwrap();
         let map_binding =
             |hir_binding_id: hir::BindingId| bindings_map.get(hir_binding_id).copied().unwrap();
-
+            
+            
         let mut binding_defs: ArenaMap<_, SmallVec<_>> = body
             .bindings
             .iter()
@@ -330,6 +334,12 @@ impl<'a> ThirBodyBuilder<'a> {
                 (map_binding(id), defs)
             })
             .collect();
+        let self_def_id = body.self_param.map(|binding_id| {
+            let binding_id  = map_binding(binding_id);
+            let def_id  = defs.alloc(Def::Pat(Pat::Bind { annotation: None, binding_id, subpat:None }));
+            binding_defs.entry(binding_id).or_default().push(def_id);
+            def_id
+        });
 
         let path_to_string = |path: &Path| -> String {
             match path {
@@ -381,6 +391,22 @@ impl<'a> ThirBodyBuilder<'a> {
                 PathInfo::Binding(map_binding(binding))
             } else {
                 PathInfo::Path(path_to_string(path))
+            }
+        };
+
+        let lit_to_str = |lt:&Literal|->String{
+            match lt {
+                hir::Literal::String(string) => {
+                    format!("\"{}\"", string)
+                }
+                hir::Literal::CString(bytes) | hir::Literal::ByteString(bytes) => {
+                    format!("\"[{}]\"", bytes.iter().map(|i| i.to_string()).join(","))
+                }
+                hir::Literal::Char(c) => format!("'{}'", c),
+                hir::Literal::Bool(b) => b.to_string(),
+                hir::Literal::Int(i, _) => i.to_string(),
+                hir::Literal::Uint(u, _) => u.to_string(),
+                hir::Literal::Float(f, _) => f.to_string(),
             }
         };
 
@@ -441,6 +467,7 @@ impl<'a> ThirBodyBuilder<'a> {
                                     }
                                 }
                                 hir::Statement::Expr { expr, .. } => map_expr(*expr),
+                                hir::Statement::Item=>return None, // correct?
                             };
                             *last = id;
                             Some(id)
@@ -551,19 +578,8 @@ impl<'a> ThirBodyBuilder<'a> {
                     fn_name: method_name.display(db.upcast()).to_string(),
                     args: Box::from_iter(args.iter().map(|e| map_expr(*e))),
                 },
-                hir::Expr::Literal(lt) => Expr::Literal(match lt {
-                    hir::Literal::String(string) => {
-                        format!("\"{}\"", string)
-                    }
-                    hir::Literal::CString(bytes) | hir::Literal::ByteString(bytes) => {
-                        format!("\"[{}]\"", bytes.iter().map(|i| i.to_string()).join(","))
-                    }
-                    hir::Literal::Char(c) => format!("'{}'", c),
-                    hir::Literal::Bool(b) => b.to_string(),
-                    hir::Literal::Int(i, _) => i.to_string(),
-                    hir::Literal::Uint(u, _) => u.to_string(),
-                    hir::Literal::Float(f, _) => f.to_string(),
-                }),
+                hir::Expr::Literal(lt) => Expr::Literal(
+                    lit_to_str(lt)),
                 hir::Expr::Field { expr, name } => Expr::Field {
                     expr: map_expr(*expr),
                     field: name.display(db.upcast()).to_string(),
@@ -737,6 +753,21 @@ impl<'a> ThirBodyBuilder<'a> {
                 },
                 hir::Pat::ConstBlock(block) => Pat::Lit(map_expr(*block)), // TODO: not quite correct
                 // TODO: Range & Slice pats..
+                hir::Pat::Range { start, end } => {
+                    let mut map_loc = |loc:&Box<LiteralOrConst>|->DefId{
+                         match loc.as_ref()  {
+                            hir::LiteralOrConst::Literal(l) => defs.alloc(Def::Expr(Expr::Literal(lit_to_str(&l)))),
+                            hir::LiteralOrConst::Const(c) => map_pat(*c),
+                        }
+                    };
+                    let start = start.as_ref().map(&mut map_loc);
+                    let end = end.as_ref().map(&mut map_loc);
+                    Pat::Range { start, end}
+                }
+                hir::Pat::Slice { prefix, slice, suffix } =>{
+                    Pat::Slice { args:Box::from_iter(prefix.iter().chain(slice.iter()).chain(suffix.iter()).cloned().map(map_pat)) }
+                }
+                hir::Pat::Missing =>Pat::Missing,
                 _ => {
                     println!("Unhandled pattern {:?}", pat);
                     Pat::Unimplemented
@@ -750,7 +781,7 @@ impl<'a> ThirBodyBuilder<'a> {
         binding_defs.insert(ret_binding_id, smallvec![ret_def_id]);
 
         let body_def_id = map_expr(body.body_expr);
-        let param_def_ids = body.params.iter().cloned().map(map_pat).collect_vec();
+        let param_def_ids = self_def_id.iter().copied().chain( body.params.iter().cloned().map(map_pat)).collect_vec();
         let parent_def_map = Self::parent_def_map(&defs);
         let child_def_map = Self::child_def_map(&defs, &parent_def_map);
 
@@ -788,6 +819,7 @@ impl<'a> ThirBodyBuilder<'a> {
             infer,
             defs,
             body_def_id,
+            self_def_id,
             param_def_ids,
             world_scope_id,
             ret_def_id,
@@ -1093,7 +1125,11 @@ impl<'a> ThirBodyBuilder<'a> {
                 Pat::Or { patterns: pats }
                 | Pat::Tuple { pats, .. }
                 | Pat::TupleStruct { args: pats, .. } => pats.first().cloned(),
-                Pat::Wild | Pat::Path(_) | Pat::Lit(_) | Pat::Unimplemented => None,
+                Pat::Slice { args } => {
+                    args.first().cloned()
+                },
+                Pat::Range { start, end}=>start.or(*end),
+                Pat::Missing|Pat::Wild | Pat::Path(_) | Pat::Lit(_) | Pat::Unimplemented => None,
             },
             Def::Noop => None,
         };
@@ -1512,7 +1548,19 @@ impl<'a> ThirBodyBuilder<'a> {
                         set_sequence(&args.iter().map(|(_, pat)| *pat).collect_vec());
                     }
                     Pat::TupleStruct { args, .. } => set_sequence(&args),
-                    Pat::Path(_) | Pat::Wild | Pat::Unimplemented => set_sequence(&[]),
+                    Pat::Slice { args } => {
+                        set_sequence(&args);
+                    },
+                    Pat::Range { start,end }=> {
+                        match (start, end) {
+                            (Some(s), Some(e)) => set_sequence(&[*s , *e]),
+                            (Some(s),None) => set_sequence(&[*s ]),
+                            (None, Some(e)) => set_sequence(&[*e]),
+                            (None,None) => set_sequence(&[]),
+                        }
+                    }
+                    Pat::Missing|Pat::Path(_) | Pat::Wild | Pat::Unimplemented => set_sequence(&[]),
+                    
                 },
                 Def::Noop => set_sequence(&[]),
             }
@@ -1772,8 +1820,8 @@ impl<'a> ThirBodyBuilder<'a> {
                                             }
 
                                             match &edge.kind {
-                                                EdgeKind::Ref(mutable) => {
-                                                    Some((DefEdgeKind::Ref(*mutable), span))
+                                                EdgeKind::Ref{ mutability }=> {
+                                                    Some((DefEdgeKind::Ref{mutability:*mutability}, span))
                                                 }
                                                 EdgeKind::Move => {
                                                     Some((DefEdgeKind::Move(!*is_root), span))

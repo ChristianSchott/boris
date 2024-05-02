@@ -230,6 +230,7 @@ pub enum Expr {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Pat {
     Wild,
+    Missing, // `..` - pattern
     Path(String),
     Lit(DefId),
     Bind {
@@ -257,6 +258,13 @@ pub enum Pat {
         path: String,
         args: Box<[DefId]>,
         ellipsis: Option<usize>,
+    },
+    Range {
+        start: Option<DefId>,
+        end: Option<DefId>,
+    },
+    Slice {
+        args: Box<[DefId]>,
     },
     Unimplemented,
 }
@@ -478,7 +486,7 @@ pub enum NodeKind {
 pub enum DefEdgeKind {
     Move(bool), // partial
     Copy,
-    Ref(bool),
+    Ref { mutability: bool },
     Reassign,
     ReassignSource,
     Deref,

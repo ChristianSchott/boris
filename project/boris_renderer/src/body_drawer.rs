@@ -273,13 +273,36 @@ impl<'a> BodyRenderer<'a> {
         buffer.append_sequential(&children, false, &self.state)
     }
 
+    fn append_range(
+        &self,
+        buffer: &mut DrawBuffer,
+        from: Option<DrawCallId>,
+        to: Option<DrawCallId>,
+        inclusive: bool,
+    ) -> DrawCallId {
+        let range_lit = buffer.cached_literal(TextLitKind::Range(inclusive));
+        match (from, to) {
+            (Some(lhs), Some(rhs)) => {
+                if buffer.is_complex(lhs) || buffer.is_complex(rhs) {
+                    let rhs = buffer.append_horizontal(&[range_lit, rhs], false);
+                    buffer.append_sequential(&[lhs, rhs], false, &self.state)
+                } else {
+                    buffer.append_horizontal(&[lhs, range_lit, rhs], false)
+                }
+            }
+            (None, Some(rhs)) => buffer.append_horizontal(&[range_lit, rhs], false),
+            (Some(lhs), None) => buffer.append_horizontal(&[lhs, range_lit], false),
+            (None, None) => range_lit,
+        }
+    }
+
     fn append_expr(&self, buffer: &mut DrawBuffer, expr: &Expr, id: DefId) -> DrawCallId {
         match expr {
             Expr::Path(info) => match info {
                 PathInfo::Binding(id) => buffer.append_str(&self.body.bindings[*id].name()),
                 PathInfo::Path(path) => buffer.append_str(&path),
             },
-            Expr::Literal(lit) => buffer.append_str(&lit),
+            Expr::Literal(lit) => buffer.append_str_colored(&lit, Color32::DARK_GREEN),
             Expr::Block(block) => self.append_block(buffer, id, block, None),
             Expr::IfArm {
                 condition,
@@ -447,20 +470,9 @@ impl<'a> BodyRenderer<'a> {
                 rhs,
                 inclusive,
             } => {
-                let range_lit = buffer.cached_literal(TextLitKind::Range(*inclusive));
-                match (self.append_opt(buffer, *lhs), self.append_opt(buffer, *rhs)) {
-                    (Some(lhs), Some(rhs)) => {
-                        if buffer.is_complex(lhs) || buffer.is_complex(rhs) {
-                            let rhs = buffer.append_horizontal(&[range_lit, rhs], false);
-                            buffer.append_sequential(&[lhs, rhs], false, &self.state)
-                        } else {
-                            buffer.append_horizontal(&[lhs, range_lit, rhs], false)
-                        }
-                    }
-                    (None, Some(rhs)) => buffer.append_horizontal(&[range_lit, rhs], false),
-                    (Some(lhs), None) => buffer.append_horizontal(&[lhs, range_lit], false),
-                    (None, None) => range_lit,
-                }
+                let from = self.append_opt(buffer, *lhs);
+                let to = self.append_opt(buffer, *rhs);
+                self.append_range(buffer, from, to, *inclusive)
             }
             Expr::RecordLit {
                 path,
@@ -669,7 +681,21 @@ impl<'a> BodyRenderer<'a> {
                 ];
                 buffer.append_horizontal(&children, false)
             }
+            Pat::Range { start, end } => {
+                let from = start.as_ref().map(|t| self.append_def(buffer, *t));
+                let to = end.as_ref().map(|t| self.append_def(buffer, *t));
+                self.append_range(buffer, from, to, false)
+            }
+            Pat::Slice { args } => {
+                let args = Box::from_iter(args.iter().map(|id| self.append_def(buffer, *id)));
+                let args = self.append_args(buffer, &args);
+                buffer.append_braced(args, BracketType::Square, Color32::BLACK)
+            }
             Pat::Unimplemented => buffer.append_str("<missing>"),
+            Pat::Missing => {
+                let dot = buffer.cached_literal(TextLitKind::Dot);
+                buffer.append_horizontal(&[dot, dot], false)
+            }
         }
     }
 

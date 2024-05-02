@@ -5,10 +5,6 @@ Aiming to make these concepts easier to grasp for beginners, and experienced pro
 
 This project is part of my master's thesis at the Julius-Maximilians-University Würzburg, so the main focus is currently on finishing the thesis, not adding more features and fixing bugs ( feel free to do so, though :) )
 
-**There is currently an ongoing survey to evaluate this project:** https://opnform.com/forms/visualizing-ownership-and-borrowing-in-rust-programs-nseo4z 
-
-Please consider taking two minutes and filling out the form, it would help a lot! :) (it contains only 7 short questions)
-
 For now it is a standalone program, but IDE integration may be something to look into for the future.
 
 ![](/imgs/app_example.png)
@@ -43,20 +39,20 @@ App:
 WASM Viewer:
 
 - run `trunk serve` in the `boris_viewer` folder for running the web viewer application locally. More information about deploying can be found [here](https://github.com/emilk/eframe_template#web-locally).
-  - the viewer directly embeds pre-analysed function bodies from the `./example/export/bodies/` folder (see `./project/boris_viewer/examples.rs`)
-  - access examples via `url/#example_name` (e.g., https://christianschott.github.io/boris-viewer/#ownership or https://christianschott.github.io/boris-viewer/#higher_order_fn)
+- the viewer directly embeds pre-analysed function bodies from the `./example/export/bodies/` folder (see `./project/boris_viewer/examples.rs`)
+- access examples via `url/#example_name` (e.g., https://christianschott.github.io/boris-viewer/#ownership)
 
-## Credits
-
-It is based on the powerful [rust-analyzer](https://github.com/rust-lang/rust-analyzer) crate, making this whole project even possible.
-A special shoutout to [@HKalbasi](https://github.com/HKalbasi) for his recent work on adding [MIR](https://github.com/rust-lang/rust-analyzer/pull/14040) lowering to rust-analyzer, which was essential to this project, and of course the whole RA team.
-
-For the rendering it utilizes [egui](https://github.com/emilk/egui), as it provided a very fast and simple way for drawing to the screen.
-
-Some obvious inspirations:
+## Related Works:
 
 - [RustViz](https://github.com/rustviz/rustviz)
+- [Aquascope](https://github.com/cognitive-engineering-lab/aquascope)
 - [Graphical depiction of ownership and borrowing in Rust](https://rufflewind.com/2017-02-15/rust-move-copy-borrow)
 - [Think Spatially to Grok Lifetimes](https://www.justanotherdot.com/posts/think-spatially-to-grok-lifetimes.html)
 - [Rust Lifetime Visualization Ideas](https://blog.adamant-lang.org/2019/rust-lifetime-visualization-ideas/)
 - [Flowistry](https://github.com/willcrichton/flowistry/)
+- [REVIS](https://marketplace.visualstudio.com/items?itemName=weirane.errorviz)
+
+## Credits
+
+It is based on the powerful [rust-analyzer](https://github.com/rust-lang/rust-analyzer) crate, making this whole project even possible.
+For the rendering it utilizes [egui](https://github.com/emilk/egui), as it provided a very fast and simple way for drawing to the screen.

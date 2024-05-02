@@ -1,5 +1,4 @@
 use boris_shared::{BirBody, DefId, ExampleState};
-use itertools::Itertools;
 
 #[derive(Default)]
 pub struct TemplateApp {

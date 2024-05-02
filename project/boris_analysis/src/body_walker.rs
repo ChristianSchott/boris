@@ -1,14 +1,14 @@
-use boris_shared::{BindingId, ConflictKind, Def, DefId, DependencyKind, Expr, UnaryOp};
+use boris_shared::{BindingId, ConflictKind, Def, DefId, Expr, UnaryOp};
 use hir_def::{
     path::{GenericArg, GenericArgs, Path},
     type_ref::{LifetimeRef, TypeBound},
-    DefWithBodyId, FunctionId, HasModule, TupleFieldId, TupleId,
+    FunctionId, HasModule, TupleFieldId, TupleId,
 };
 use hir_ty::{
-    db::HirDatabase,
+    db::{HirDatabase, InternedClosure},
     mir::{
-        BasicBlockId, BorrowKind, LocalId, MirBody, MirLowerError, Operand, Place, Rvalue,
-        StatementKind, TerminatorKind,
+        BasicBlockId, BorrowKind, LocalId, MirBody, MirLowerError, Operand, Place, ProjectionElem,
+        Rvalue, StatementKind, TerminatorKind,
     },
     ClosureId, Interner, TyExt, TyKind,
 };
@@ -89,7 +89,7 @@ pub struct Conflict {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum EdgeKind {
-    Ref(bool), // mutability
+    Ref { mutability: bool },
     Move,
     Copy,
     Deref,
@@ -389,7 +389,7 @@ pub fn walk_thir_body<'a>(
     //  TODO: prop errors..
     let body = db.mir_body(owner.into())?; // FIXME: unwrap
     let body_walker = MirBodyWalker::new(thir_builder, &body, db);
-    body_walker.walk(&mut graph, None, Some(thir_builder.return_binding()));
+    body_walker.walk(&mut graph, None, Some(thir_builder.return_binding()))?;
     Result::Ok(graph)
 }
 
@@ -877,19 +877,19 @@ impl<'a> MirBodyWalker<'a> {
                                     self.find_op_usage(loc, place, BindingUsageHint::None)
                                 };
 
-                                let kind = match kind {
-                                    BorrowKind::Shared | BorrowKind::Shallow => {
-                                        EdgeKind::Ref(false)
-                                    }
-                                    BorrowKind::Unique | BorrowKind::Mut { .. } => {
-                                        EdgeKind::Ref(true)
-                                    }
+                                let kind = EdgeKind::Ref {
+                                    mutability: match kind {
+                                        BorrowKind::Shared | BorrowKind::Shallow => false,
+                                        BorrowKind::Mut { .. } => true,
+                                    },
                                 };
+
                                 let ref_node = use_place(graph, place, kind, span, &mut usages);
                                 if graph[ref_node].lifetimes.is_empty() {
                                     let lt = graph.lifetime.alloc(Lifetime::default());
                                     graph.associate_lt(lt, ref_node);
                                 }
+
                                 graph.connect_lifetimes(ref_node, lvalue_node);
                             }
                             Rvalue::CopyForDeref(place) => {
@@ -1152,7 +1152,10 @@ impl<'a> MirBodyWalker<'a> {
                                 //     })
                                 // }
 
-                                if let EdgeKind::Ref(true) = usage_kind {
+                                if let EdgeKind::Ref {
+                                    mutability: true, ..
+                                } = usage_kind
+                                {
                                     let targets: Vec<_> = state
                                         .iter_sources()
                                         .filter_map(|source| match graph.nodes[source].kind {
@@ -1355,7 +1358,7 @@ impl<'a> MirBodyWalker<'a> {
                     ty,
                     self.db,
                     |c, subst, f| {
-                        let (def, _) = self.db.lookup_intern_closure(c.into());
+                        let InternedClosure(def, ..) = self.db.lookup_intern_closure(c.into());
                         let infer = self.db.infer(def);
                         let (captures, _) = infer.closure_info(&c);
                         let capture = captures.get(f).expect("broken closure field");

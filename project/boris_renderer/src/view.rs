@@ -67,7 +67,7 @@ impl Tree {
             DefEdgeKind::Move(partial) => UsageKind::Move(partial),
             DefEdgeKind::Copy => UsageKind::Copy,
             DefEdgeKind::Deref => UsageKind::Deref,
-            DefEdgeKind::Ref(mutable) => UsageKind::Reference(mutable),
+            DefEdgeKind::Ref { mutability } => UsageKind::Reference { mutability },
             DefEdgeKind::Reassign => {
                 self.add_source(def, activity);
                 return;
@@ -255,7 +255,7 @@ pub fn boris_view(
                                     kind,
                                     DefEdgeKind::Copy
                                         | DefEdgeKind::Move(_)
-                                        | DefEdgeKind::Ref(_)
+                                        | DefEdgeKind::Ref { .. }
                                         | DefEdgeKind::Deref
                                 )
                                 .then_some(*to)

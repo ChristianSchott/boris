@@ -1,6 +1,6 @@
 use either::Either;
 use la_arena::{Arena, ArenaMap, Idx};
-use ra_ap_hir::{known::sub, Adt, GenericDef, HasSource};
+use ra_ap_hir::{db::InternedClosure, Adt, GenericDef};
 use ra_ap_hir_def::{DefWithBodyId, FieldId, HasModule, TupleFieldId};
 use ra_ap_hir_ty::{
     db::HirDatabase,
@@ -102,7 +102,7 @@ impl MovePath {
                     .any(|ty| Self::has_ref(ty.kind(Interner), db))
             }
             TyKind::Closure(id, subst) => {
-                let (def, _) = db.lookup_intern_closure((*id).into());
+                let InternedClosure(def, ..) = db.lookup_intern_closure((*id).into());
                 let infer = db.infer(def);
                 let (captures, _) = infer.closure_info(id);
                 // capture by ref, or captures a reference
@@ -183,7 +183,7 @@ impl<'a> MoveData<'a> {
             ty,
             self.db,
             |c, subst, f| {
-                let (def, _) = self.db.lookup_intern_closure(c.into());
+                let InternedClosure(def, ..) = self.db.lookup_intern_closure(c.into());
                 let infer = self.db.infer(def);
                 let (captures, _) = infer.closure_info(&c);
                 captures.get(f).expect("broken closure field").ty(subst)

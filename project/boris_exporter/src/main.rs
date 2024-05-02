@@ -54,6 +54,11 @@ fn main() -> Result<(), ErrorKind> {
         Item::new("lt_annotation_limit", "lt_annotations", Some("world")),
         Item::new("closure_capture", "closure_capture_ref", Some("x")),
         Item::new("lt_annotation_test", "main", Some("x")),
+        Item::new("copy_test", "main", Some("x")),
+        Item::new("evaluation_order", "main", None),
+        Item::new("branching", "main", None),
+        Item::new("complex_arg", "complex_arg", None),
+        Item::new("revis", "binding_move", Some("x")),
     ];
     let export_items = examples.clone();
     let capture_items = examples.clone();

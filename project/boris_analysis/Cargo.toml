@@ -7,17 +7,18 @@ edition = "2021"
 [dependencies]
 boris_shared = { path = "../boris_shared" }
 
-ra_ap_syntax = "0.0.198"
-ra_ap_vfs = "0.0.198"
-ra_ap_proc_macro_api = "0.0.198"
-ra_ap_hir = "0.0.198"
-ra_ap_hir_ty = "0.0.198"
-ra_ap_hir_def = "0.0.198" 
-ra_ap_project_model = "0.0.198"
-ra_ap_paths = "0.0.198"
-ra_ap_ide = "0.0.198"
-ra_ap_ide_db = "0.0.198"
-ra_ap_load-cargo = "0.0.198"
+ra_ap_syntax = "0.0.206"
+ra_ap_vfs = "0.0.206"
+ra_ap_proc_macro_api = "0.0.206"
+ra_ap_hir = "0.0.206"
+ra_ap_hir_ty = "0.0.206"
+ra_ap_hir_def = "0.0.206"
+ra_ap_project_model = "0.0.206"
+ra_ap_paths = "0.0.206"
+ra_ap_ide = "0.0.206"
+ra_ap_ide_db = "0.0.206"
+ra_ap_load-cargo = "0.0.206"
+# ra_ap_flycheck = "0.0.206"
 
 la-arena = "0.3.1"
 
@@ -30,4 +31,3 @@ itertools = "0.12.0"
 either = "1.8"
 
 triomphe = "0.1.11"
-

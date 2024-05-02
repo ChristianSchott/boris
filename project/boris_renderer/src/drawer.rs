@@ -81,7 +81,7 @@ impl Liveliness {
 pub enum UsageKind {
     Move(bool), // partial
     Copy,
-    Reference(bool), // mutability
+    Reference { mutability: bool },
     Deref,
 }
 
@@ -696,8 +696,12 @@ impl<'a> DrawBuffer<'a> {
         })
     }
 
+    pub fn append_str_colored(&mut self, text: &str, color: Color32) -> DrawCallId {
+        self.append_text(text_literal(self.ctx, text), color)
+    }
+
     pub fn append_str(&mut self, text: &str) -> DrawCallId {
-        self.append_text(text_literal(self.ctx, text), Color32::BLACK)
+        self.append_str_colored(text, Color32::BLACK)
     }
 
     pub fn append_inline(&mut self, elements: Box<[RelativeDrawCallId]>, size: Vec2) -> DrawCallId {
@@ -1354,6 +1358,13 @@ impl<'a> DrawBuffer<'a> {
             }
 
             if let CFKind::Line(_, usages) | CFKind::Closure(usages) = &kind {
+                // debug sections
+                // painter.rect_stroke(
+                //     Rect::from_min_max(from, to + Vec2::RIGHT * rect.width()),
+                //     Rounding::same(2f32),
+                //     Stroke::new(1f32, Color32::BLACK),
+                // );
+
                 for (index, (lane, call, _, usage_kind, handled)) in
                     usages.iter().cloned().enumerate()
                 {
@@ -1387,8 +1398,8 @@ impl<'a> DrawBuffer<'a> {
                         UsageKind::Copy => {
                             draw_copy(painter, join_pos, usage_pos, stroke);
                         }
-                        UsageKind::Reference(mutable) => {
-                            let ref_stroke = state.liveliness.raw_stroke(lane, false, mutable);
+                        UsageKind::Reference { mutability } => {
+                            let ref_stroke = state.liveliness.raw_stroke(lane, false, mutability);
                             draw_ref(
                                 painter,
                                 join_pos,
@@ -1540,8 +1551,8 @@ impl<'a> DrawBuffer<'a> {
         for (from, conflicts) in conflicts.iter() {
             if let Some(usage_rect) = def_rects.get(from) {
                 painter.rect_stroke(
-                    usage_rect.expand(1.5f32),
-                    Rounding::same(5f32),
+                    usage_rect.expand(0.5f32),
+                    Rounding::same(2f32),
                     error_stroke,
                 );
 
@@ -1551,9 +1562,8 @@ impl<'a> DrawBuffer<'a> {
                         for target_rect in
                             conflict.targets.iter().filter_map(|id| def_rects.get(*id))
                         {
-                            painter.rect_stroke(
-                                target_rect.expand(2.5f32),
-                                Rounding::same(5f32),
+                            painter.line_segment(
+                                [target_rect.left_bottom(), target_rect.right_bottom()],
                                 error_stroke,
                             );
                         }
@@ -1648,7 +1658,10 @@ fn draw_arc(painter: &Painter, join: Pos2, line_height: f32, end: Pos2, stroke: 
 
 fn draw_copy(painter: &Painter, join: Pos2, usage: Pos2, stroke: Stroke) {
     let corner = pos2(usage.x, join.y);
-    painter.line_segment([join, corner + Vec2::RIGHT * stroke.width * 0.5f32], stroke);
+    painter.line_segment(
+        [join, corner + Vec2::RIGHT * stroke.width * 0.25f32],
+        stroke,
+    );
     painter.line_segment([corner, usage], stroke);
 }
 
