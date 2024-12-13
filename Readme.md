@@ -3,7 +3,7 @@
 This tool tries to visualize Rust's memory management, especially ownership transfer and borrows.
 Aiming to make these concepts easier to grasp for beginners, and experienced programmers switching from other languages.
 
-This project is part of my master's thesis at the Julius-Maximilians-University Würzburg, so the main focus is currently on finishing the thesis, not adding more features and fixing bugs ( feel free to do so, though :) )
+This project was part of my [master's thesis](/thesis) at the Julius-Maximilians-University Würzburg.
 
 For now it is a standalone program, but IDE integration may be something to look into for the future.
 
@@ -15,11 +15,12 @@ For now it is a standalone program, but IDE integration may be something to look
 
 - no borrow checker (no dependency unstable rust compiler hooks, or [polonius](https://github.com/rust-lang/polonius)).
   - no (/limited) error visualizations. However, the visualizations should still be useful while debugging borrow checker errors.
-- complex lifetime annotations: rust analyzer does not lower lifetime annotations properly yet, meaning that any `struct test<'a, 'b> {}` will be treated as `struct test<'a, 'a> {}`
+- complex lifetime annotations: at the time of writing the thesis, rust analyzer did not lower lifetime annotations properly yet, meaning that any `struct test<'a, 'b> {}` will be treated as `struct test<'a, 'a> {}`
 - `async`
 - `unsafe` (interior mutability, inline assembly, etc.)
-- bugs
-- this was my first rust project, so coding style is probably suboptimal in many cases :)
+- bugs and messy code :)
+
+Check chapter 6.1 of the thesis for a more detailed breakdown of the limitations.
 
 ## Crates
 
